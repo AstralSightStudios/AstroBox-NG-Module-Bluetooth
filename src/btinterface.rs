@@ -67,7 +67,7 @@ pub enum SendError {
 
 impl_error!(
     SendError,
-    Disconnected => "disconnected",
+    Disconnected => "SendError: disconnected",
     BleCharaNotFound => "ble characteristic not found",
     TooLong => "data too long",
 );
@@ -80,7 +80,7 @@ pub enum SubscribeError {
 
 impl_error!(
     SubscribeError,
-    Disconnected => "disconnected",
+    Disconnected => "SubscribeError: disconnected",
     BleCharaNotFound => "ble characteristic not found",
 );
 
