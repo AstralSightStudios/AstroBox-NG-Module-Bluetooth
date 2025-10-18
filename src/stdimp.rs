@@ -1,5 +1,8 @@
+// TODO: 等待蓝牙重构以替换掉这个庞大的转接文件
+
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
@@ -24,7 +27,14 @@ use crate::btinterface::{
     SendError, SubscribeError,
 };
 
+const BLE_UUID_KEYWORD_XIAOMI_SERVICE: &str = "0050";
+const BLE_UUID_KEYWORD_XIAOMI_SENT: &str = "005f";
+const BLE_UUID_KEYWORD_XIAOMI_RECV: &str = "005e";
+
 static APP_HANDLE: OnceLock<AppHandle<Wry>> = OnceLock::new();
+
+#[cfg(not(target_os = "android"))]
+static BLE_ADAPTER: OnceLock<Adapter> = OnceLock::new();
 
 pub fn init(app: AppHandle<Wry>) -> tauri::Result<()> {
     app.plugin(btclassic_spp::init())?;
@@ -60,15 +70,33 @@ pub fn normalize_addr_for_dedup(raw: &str) -> String {
     s.to_ascii_uppercase()
 }
 
-#[derive(Debug)]
 pub struct StdImp {
     connect_type: ConnectType,
 
     ble_device: Mutex<Option<BluestDevice>>,
     ble_services: Mutex<Option<Vec<BluestService>>>,
     ble_chara_cache: Mutex<HashMap<Uuid, Characteristic>>,
+    ble_char_bundle: Mutex<Option<BleCharacteristicBundle>>,
+    #[cfg(not(target_os = "android"))]
+    ble_scanned_devices: Arc<Mutex<HashMap<String, BluestDevice>>>,
+    ble_on_connected: Mutex<Option<Arc<dyn Fn() + Send + Sync + 'static>>>,
     scan_abort: Mutex<Option<AbortHandle>>,
     scan_results: Arc<Mutex<Vec<BluetoothDevice>>>,
+}
+
+impl fmt::Debug for StdImp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StdImp")
+            .field("connect_type", &self.connect_type)
+            .finish()
+    }
+}
+
+#[derive(Debug, Default)]
+struct BleCharacteristicBundle {
+    service: Option<Uuid>,
+    recv: Option<Uuid>,
+    sent: Option<Uuid>,
 }
 
 impl StdImp {
@@ -78,6 +106,10 @@ impl StdImp {
             ble_device: Mutex::new(None),
             ble_services: Mutex::new(None),
             ble_chara_cache: Mutex::new(HashMap::new()),
+            ble_char_bundle: Mutex::new(None),
+            #[cfg(not(target_os = "android"))]
+            ble_scanned_devices: Arc::new(Mutex::new(HashMap::new())),
+            ble_on_connected: Mutex::new(None),
             scan_abort: Mutex::new(None),
             scan_results: Arc::new(Mutex::new(Vec::new())),
         }
@@ -86,6 +118,63 @@ impl StdImp {
     #[inline]
     fn app() -> Option<&'static AppHandle<Wry>> {
         APP_HANDLE.get()
+    }
+
+    #[cfg(not(target_os = "android"))]
+    async fn ble_adapter() -> Result<&'static Adapter, ConnectError> {
+        if let Some(adapter) = BLE_ADAPTER.get() {
+            return Ok(adapter);
+        }
+
+        let adapter = Adapter::default()
+            .await
+            .ok_or(ConnectError::DeviceNotFound)?;
+        adapter
+            .wait_available()
+            .await
+            .map_err(|_| ConnectError::DeviceNotFound)?;
+
+        if BLE_ADAPTER.set(adapter).is_err() {
+            // another concurrent initializer won the race; fall through
+        }
+        BLE_ADAPTER
+            .get()
+            .ok_or(ConnectError::DeviceNotFound)
+    }
+
+    fn uuid_contains(uuid: &Uuid, needle: &str) -> bool {
+        let lowered_needle = needle.to_ascii_lowercase();
+        let haystack: String = uuid
+            .to_string()
+            .chars()
+            .filter(|c| *c != '-')
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        haystack.contains(&lowered_needle)
+    }
+
+    fn ble_default_recv_uuid(&self) -> Option<Uuid> {
+        self.ble_char_bundle
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|bundle| bundle.recv)
+    }
+
+    fn ble_default_sent_uuid(&self) -> Option<Uuid> {
+        self.ble_char_bundle
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|bundle| bundle.sent)
+    }
+
+    fn ble_default_service_uuid(&self) -> Option<Uuid> {
+        self.ble_char_bundle
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|bundle| bundle.service)
     }
 
     #[cfg(not(target_os = "android"))]
@@ -128,10 +217,62 @@ impl StdImp {
         Err(SubscribeError::BleCharaNotFound)
     }
 
+    #[cfg(not(target_os = "android"))]
+    async fn ble_extract_xiaomi_characteristics(
+        &self,
+        services: &[BluestService],
+    ) -> Result<(), ConnectError> {
+        let mut bundle = BleCharacteristicBundle::default();
+
+        for svc in services {
+            let svc_uuid = svc.uuid();
+            if !Self::uuid_contains(&svc_uuid, "fe95") {
+                continue;
+            }
+
+            let chars = svc
+                .discover_characteristics()
+                .await
+                .map_err(|_| ConnectError::TargetRejected)?;
+
+            for c in chars {
+                let cuuid = c.uuid();
+                if Self::uuid_contains(&cuuid, BLE_UUID_KEYWORD_XIAOMI_RECV) {
+                    log::debug!(
+                        "StdImp::ble_extract_xiaomi_characteristics detected recv characteristic {}",
+                        cuuid
+                    );
+                    bundle.recv = Some(cuuid);
+                } else if Self::uuid_contains(&cuuid, BLE_UUID_KEYWORD_XIAOMI_SENT) {
+                    log::debug!(
+                        "StdImp::ble_extract_xiaomi_characteristics detected sent characteristic {}",
+                        cuuid
+                    );
+                    bundle.sent = Some(cuuid);
+                } else if Self::uuid_contains(&cuuid, BLE_UUID_KEYWORD_XIAOMI_SERVICE) {
+                    log::debug!(
+                        "StdImp::ble_extract_xiaomi_characteristics detected service characteristic {}",
+                        cuuid
+                    );
+                    bundle.service = Some(cuuid);
+                }
+                self.ble_chara_cache.lock().unwrap().insert(cuuid, c.clone());
+            }
+        }
+
+        if bundle.recv.is_none() || bundle.sent.is_none() {
+            return Err(ConnectError::TargetRejected);
+        }
+
+        *self.ble_char_bundle.lock().unwrap() = Some(bundle);
+        Ok(())
+    }
+
     fn ble_clear_cache(&self) {
         *self.ble_device.lock().unwrap() = None;
         *self.ble_services.lock().unwrap() = None;
         self.ble_chara_cache.lock().unwrap().clear();
+        *self.ble_char_bundle.lock().unwrap() = None;
     }
 }
 
@@ -193,19 +334,21 @@ impl BluetoothInterface for StdImp {
                     }
                 }
 
-                let adapter = Adapter::default().await.ok_or(ScanError::AdapterNotFound)?;
-                adapter
-                    .wait_available()
+                let adapter = Self::ble_adapter()
                     .await
-                    .map_err(|_| ScanError::MissingPermission)?;
+                    .map_err(|_| ScanError::AdapterNotFound)?;
 
                 self.scan_results.lock().unwrap().clear();
+                #[cfg(not(target_os = "android"))]
+                self.ble_scanned_devices.lock().unwrap().clear();
 
                 let results = self.scan_results.clone();
                 let (abort_handle, abort_reg) = AbortHandle::new_pair();
                 *self.scan_abort.lock().unwrap() = Some(abort_handle);
 
                 let channel_clone = channel.clone();
+                #[cfg(not(target_os = "android"))]
+                let scanned_devices = Arc::clone(&self.ble_scanned_devices);
                 tauri::async_runtime::spawn(async move {
                     let mut stream = match adapter.scan(&[]).await {
                         Ok(s) => s,
@@ -222,6 +365,11 @@ impl BluetoothInterface for StdImp {
                                 continue;
                             }
                             if known_addrs.insert(key) {
+                                #[cfg(not(target_os = "android"))]
+                                scanned_devices
+                                    .lock()
+                                    .unwrap()
+                                    .insert(raw_addr.clone(), dev.device.clone());
                                 results.lock().unwrap().push(BluetoothDevice {
                                     name: name.clone(),
                                     addr: raw_addr.clone(),
@@ -299,44 +447,111 @@ impl BluetoothInterface for StdImp {
 
             #[cfg(not(target_os = "android"))]
             ConnectType::BLE => tauri::async_runtime::block_on(async {
-                let adapter = Adapter::default()
-                    .await
-                    .ok_or(ConnectError::DeviceNotFound)?;
-                adapter
-                    .wait_available()
-                    .await
-                    .map_err(|_| ConnectError::DeviceNotFound)?;
+                log::info!("StdImp::connect (BLE) starting for addr={}", addr);
+                let adapter = Self::ble_adapter().await?;
 
-                let mut scan = adapter
-                    .scan(&[])
-                    .await
-                    .map_err(|_| ConnectError::DeviceNotFound)?;
-                let deadline = Instant::now() + Duration::from_secs(12);
-                let mut found: Option<BluestDevice> = None;
-                while Instant::now() < deadline {
-                    if let Some(dev) = scan.next().await {
-                        if dev.device.id().to_string().eq_ignore_ascii_case(&addr) {
-                            found = Some(dev.device);
-                            break;
+                let mut device_opt = {
+                    let map = self.ble_scanned_devices.lock().unwrap();
+                    map.get(&addr).cloned()
+                };
+
+                if device_opt.is_none() {
+                    log::debug!(
+                        "StdImp::connect (BLE) cache miss for addr={}, starting on-demand scan",
+                        addr
+                    );
+                    let mut scan = adapter
+                        .scan(&[])
+                        .await
+                        .map_err(|_| ConnectError::DeviceNotFound)?;
+                    let deadline = Instant::now() + Duration::from_secs(12);
+                    while Instant::now() < deadline {
+                        if let Some(dev) = scan.next().await {
+                            if dev.device.id().to_string().eq_ignore_ascii_case(&addr) {
+                                device_opt = Some(dev.device.clone());
+                                #[cfg(not(target_os = "android"))]
+                                self.ble_scanned_devices
+                                    .lock()
+                                    .unwrap()
+                                    .insert(addr.clone(), dev.device.clone());
+                                break;
+                            }
+                        } else {
+                            tokio::time::sleep(Duration::from_millis(60)).await;
                         }
-                    } else {
-                        tokio::time::sleep(Duration::from_millis(60)).await;
                     }
                 }
-                let device = found.ok_or(ConnectError::DeviceNotFound)?;
+
+                let device = device_opt.ok_or(ConnectError::DeviceNotFound)?;
+                log::debug!(
+                    "StdImp::connect (BLE) using cached device handle for addr={}",
+                    addr
+                );
 
                 adapter
                     .connect_device(&device)
                     .await
                     .map_err(|_| ConnectError::TargetRejected)?;
+                log::info!(
+                    "StdImp::connect (BLE) controller connection established addr={}",
+                    addr
+                );
+
+                let mut attempts = 0;
+                while !device.is_connected().await {
+                    if attempts >= 20 {
+                        log::warn!(
+                            "StdImp::connect (BLE) device still reports disconnected after {} checks",
+                            attempts
+                        );
+                        break;
+                    }
+                    attempts += 1;
+                    log::debug!(
+                        "StdImp::connect (BLE) waiting for device to report connected (attempt {})",
+                        attempts
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                log::info!(
+                    "StdImp::connect (BLE) device is_connected={} after wait",
+                    device.is_connected().await
+                );
+
+                if let Err(e) = device.pair().await {
+                    log::warn!("BLE pair failed: {}", e);
+                }
+
                 let services = device
                     .discover_services()
                     .await
                     .map_err(|_| ConnectError::TargetRejected)?;
+                log::info!(
+                    "StdImp::connect (BLE) discovered {} services for addr={}",
+                    services.len(),
+                    addr
+                );
+
+                self.ble_chara_cache.lock().unwrap().clear();
+                self.ble_char_bundle.lock().unwrap().take();
+
+                self.ble_extract_xiaomi_characteristics(&services).await?;
 
                 *self.ble_device.lock().unwrap() = Some(device);
                 *self.ble_services.lock().unwrap() = Some(services);
-                self.ble_chara_cache.lock().unwrap().clear();
+
+                let cb_opt = self.ble_on_connected.lock().unwrap().clone();
+                if let Some(cb) = cb_opt {
+                    log::info!(
+                        "StdImp::connect (BLE) invoking on_connected callback for addr={}",
+                        addr
+                    );
+                    cb();
+                } else {
+                    log::warn!(
+                        "StdImp::connect (BLE) no on_connected callback registered; upper layers may hang"
+                    );
+                }
 
                 Ok(())
             }),
@@ -357,7 +572,8 @@ impl BluetoothInterface for StdImp {
                 }
             }
             ConnectType::BLE => {
-                let _ = &cb;
+                log::debug!("StdImp::set_on_connected_listener registered BLE callback");
+                *self.ble_on_connected.lock().unwrap() = Some(cb);
             }
         }
     }
@@ -373,8 +589,14 @@ impl BluetoothInterface for StdImp {
 
             #[cfg(not(target_os = "android"))]
             ConnectType::BLE => {
-                let uuid = characteristic.ok_or(SendError::BleCharaNotFound)?;
+                let uuid = match characteristic {
+                    Some(uuid) => uuid,
+                    None => self
+                        .ble_default_sent_uuid()
+                        .ok_or(SendError::BleCharaNotFound)?,
+                };
                 tauri::async_runtime::block_on(async {
+                    log::debug!("StdImp::send (BLE) writing {} bytes to char {}", data.len(), uuid);
                     if self.ble_device.lock().unwrap().is_none() {
                         return Err(SendError::Disconnected);
                     }
@@ -417,11 +639,17 @@ impl BluetoothInterface for StdImp {
 
             #[cfg(not(target_os = "android"))]
             ConnectType::BLE => {
-                let uuid = characteristic.ok_or(SubscribeError::BleCharaNotFound)?;
+                let uuid = match characteristic {
+                    Some(uuid) => uuid,
+                    None => self
+                        .ble_default_recv_uuid()
+                        .ok_or(SubscribeError::BleCharaNotFound)?,
+                };
                 tauri::async_runtime::block_on(async {
                     if self.ble_device.lock().unwrap().is_none() {
                         return Err(SubscribeError::Disconnected);
                     }
+                    log::info!("StdImp::subscribe (BLE) attempting to subscribe to {}", uuid);
                     let chara = self.ble_get_or_discover_chara(uuid).await?;
                     let cb_clone = cb.clone();
                     tauri::async_runtime::spawn(async move {
@@ -434,9 +662,25 @@ impl BluetoothInterface for StdImp {
                                     }
                                 }
                             }
-                            Err(e) => (cb_clone)(Err(e.to_string())),
+                            Err(e) => {
+                                log::error!(
+                                    "StdImp::subscribe (BLE) failed to start notify on {}: {}",
+                                    uuid,
+                                    e
+                                );
+                                (cb_clone)(Err(e.to_string()))
+                            }
                         }
                     });
+
+                    if let Some(service_uuid) = self.ble_default_service_uuid() {
+                        if let Ok(service_chara) = self.ble_get_or_discover_chara(service_uuid).await
+                        {
+                            if let Err(e) = service_chara.read().await {
+                                log::debug!("Failed to read Xiaomi service characteristic: {}", e);
+                            }
+                        }
+                    }
                     Ok(())
                 })
             }
@@ -460,7 +704,7 @@ impl BluetoothInterface for StdImp {
                 let dev_opt = self.ble_device.lock().unwrap().clone();
                 if let Some(dev) = dev_opt {
                     let res = tauri::async_runtime::block_on(async {
-                        if let Some(adapter) = Adapter::default().await {
+                        if let Ok(adapter) = Self::ble_adapter().await {
                             adapter
                                 .disconnect_device(&dev)
                                 .await
