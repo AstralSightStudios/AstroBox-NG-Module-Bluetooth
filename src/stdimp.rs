@@ -312,7 +312,7 @@ impl StdImp {
 
 impl BluetoothInterface for StdImp {
     fn start_scan(&self, channel: tauri::ipc::Channel<BluetoothDevice>) -> Result<(), ScanError> {
-        log::debug!(
+        log::info!(
             "StdImp::start_scan invoked for {:?}; current scan_state active={} (linux={})",
             self.connect_type,
             self.scan_state.lock().unwrap().is_some(),
@@ -382,7 +382,7 @@ impl BluetoothInterface for StdImp {
 
             #[cfg(not(target_os = "android"))]
             ConnectType::BLE => tauri::async_runtime::block_on(async {
-                log::debug!(
+                log::info!(
                     "StdImp::start_scan (BLE) preparing new scan session; previous state cleared={}",
                     self.scan_state.lock().unwrap().is_none()
                 );
@@ -411,14 +411,14 @@ impl BluetoothInterface for StdImp {
 
                 #[cfg(target_os = "linux")]
                 if let Some(app) = Self::app() {
-                    log::debug!("StdImp::start_scan (BLE, linux) ensuring btclassic-spp scan stopped before BLE discovery");
+                    log::info!("StdImp::start_scan (BLE, linux) ensuring btclassic-spp scan stopped before BLE discovery");
                     if let Err(err) = app.btclassic_spp().stop_scan() {
-                        log::debug!(
+                        log::info!(
                             "StdImp::start_scan (BLE, linux) pre-emptively stopped SPP scan: {}",
                             err
                         );
                     } else {
-                        log::debug!(
+                        log::info!(
                             "StdImp::start_scan (BLE, linux) btclassic-spp stop_scan returned success"
                         );
                     }
@@ -468,7 +468,7 @@ impl BluetoothInterface for StdImp {
                             {
                                 let err_kind = err.kind();
                                 let err_msg = err.message().to_string();
-                                log::debug!(
+                                log::info!(
                                     "StdImp::start_scan (BLE) scan attempt {} returned error kind={:?} message='{}'",
                                     retry_index + 1,
                                     err_kind,
@@ -481,7 +481,7 @@ impl BluetoothInterface for StdImp {
                                     let delay = Duration::from_millis(
                                         BLE_SCAN_RETRY_BASE_DELAY_MS * retry_index as u64,
                                     );
-                                    log::debug!(
+                                    log::info!(
                                         "StdImp::start_scan (BLE) discovery already active, retry {} after {:?}",
                                         retry_index,
                                         delay
