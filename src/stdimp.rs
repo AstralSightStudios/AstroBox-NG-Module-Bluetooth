@@ -102,10 +102,17 @@ struct BleCharacteristicBundle {
     sent: Option<Uuid>,
 }
 
-struct ScanSession {
-    id: usize,
-    abort_handle: AbortHandle,
-    finished: Option<oneshot::Receiver<()>>,
+#[derive(Debug)]
+enum ScanSession {
+    Spp {
+        id: usize,
+        abort_handle: AbortHandle,
+    },
+    Ble {
+        id: usize,
+        cancel_tx: Option<oneshot::Sender<()>>,
+        finished_rx: Option<oneshot::Receiver<()>>,
+    },
 }
 
 impl StdImp {
@@ -150,6 +157,19 @@ impl StdImp {
         BLE_ADAPTER
             .get()
             .ok_or(ConnectError::DeviceNotFound)
+    }
+
+    #[cfg(not(target_os = "android"))]
+    async fn shutdown_ble_scan(
+        cancel_tx: Option<oneshot::Sender<()>>,
+        finished_rx: Option<oneshot::Receiver<()>>,
+    ) {
+        if let Some(tx) = cancel_tx {
+            let _ = tx.send(());
+        }
+        if let Some(rx) = finished_rx {
+            let _ = tokio::time::timeout(Duration::from_secs(2), rx).await;
+        }
     }
 
     fn uuid_contains(uuid: &Uuid, needle: &str) -> bool {
@@ -297,12 +317,14 @@ impl BluetoothInterface for StdImp {
                     if guard.is_some() {
                         return Ok(());
                     }
-                    let session_id = self.scan_seq.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+                    let session_id = self
+                        .scan_seq
+                        .fetch_add(1, Ordering::Relaxed)
+                        .wrapping_add(1);
                     let (abort_handle, abort_reg) = AbortHandle::new_pair();
-                    *guard = Some(ScanSession {
+                    *guard = Some(ScanSession::Spp {
                         id: session_id,
                         abort_handle,
-                        finished: None,
                     });
                     (abort_reg, session_id)
                 };
@@ -334,7 +356,10 @@ impl BluetoothInterface for StdImp {
                     };
                     let _ = Abortable::new(fut, abort_reg).await;
                     let mut guard = scan_state.lock().unwrap();
-                    if guard.as_ref().map(|s| s.id) == Some(session_id) {
+                    if matches!(
+                        guard.as_ref(),
+                        Some(ScanSession::Spp { id, .. }) if *id == session_id
+                    ) {
                         guard.take();
                     }
                 });
@@ -347,10 +372,22 @@ impl BluetoothInterface for StdImp {
 
             #[cfg(not(target_os = "android"))]
             ConnectType::BLE => tauri::async_runtime::block_on(async {
-                {
-                    let guard = self.scan_state.lock().unwrap();
-                    if guard.is_some() {
-                        return Ok(());
+                if let Some(session) = {
+                    let mut guard = self.scan_state.lock().unwrap();
+                    guard.take()
+                } {
+                    match session {
+                        ScanSession::Spp { .. } => {}
+                        ScanSession::Ble {
+                            cancel_tx,
+                            finished_rx,
+                            ..
+                        } => {
+                            #[cfg(not(target_os = "android"))]
+                            Self::shutdown_ble_scan(cancel_tx, finished_rx).await;
+                            #[cfg(target_os = "android")]
+                            let _ = (cancel_tx, finished_rx);
+                        }
                     }
                 }
 
@@ -359,80 +396,100 @@ impl BluetoothInterface for StdImp {
                     .map_err(|_| ScanError::AdapterNotFound)?;
 
                 self.scan_results.lock().unwrap().clear();
-                #[cfg(not(target_os = "android"))]
                 self.ble_scanned_devices.lock().unwrap().clear();
 
-                let results = self.scan_results.clone();
-                let session_id = self.scan_seq.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-                let (abort_handle, abort_reg) = AbortHandle::new_pair();
+                let session_id = self
+                    .scan_seq
+                    .fetch_add(1, Ordering::Relaxed)
+                    .wrapping_add(1);
+                let (cancel_tx, cancel_rx) = oneshot::channel();
                 let (finished_tx, finished_rx) = oneshot::channel();
+
                 {
                     let mut guard = self.scan_state.lock().unwrap();
-                    *guard = Some(ScanSession {
+                    *guard = Some(ScanSession::Ble {
                         id: session_id,
-                        abort_handle,
-                        finished: Some(finished_rx),
+                        cancel_tx: Some(cancel_tx),
+                        finished_rx: Some(finished_rx),
                     });
                 }
 
+                let results = Arc::clone(&self.scan_results);
                 let scan_state = Arc::clone(&self.scan_state);
                 let channel_clone = channel.clone();
-                #[cfg(not(target_os = "android"))]
                 let scanned_devices = Arc::clone(&self.ble_scanned_devices);
-                tauri::async_runtime::spawn(async move {
-                    let mut finish_tx = Some(finished_tx);
-                    let mut send_finish = |sender: &mut Option<oneshot::Sender<()>>| {
-                        if let Some(sender) = sender.take() {
-                            let _ = sender.send(());
-                        }
-                    };
+                let adapter_clone = adapter.clone();
 
-                    let mut stream = match adapter.scan(&[]).await {
+                tauri::async_runtime::spawn(async move {
+                    let mut cancel_rx = cancel_rx;
+                    let mut finish_tx = Some(finished_tx);
+                    let mut known_addrs = HashSet::<String>::new();
+
+                    let mut stream = match adapter_clone.scan(&[]).await {
                         Ok(s) => s,
                         Err(err) => {
                             log::warn!(
                                 "StdImp::start_scan (BLE) failed to start discovery: {}",
                                 err
                             );
-                            send_finish(&mut finish_tx);
+                            if let Some(tx) = finish_tx.take() {
+                                let _ = tx.send(());
+                            }
                             let mut guard = scan_state.lock().unwrap();
-                            if guard.as_ref().map(|s| s.id) == Some(session_id) {
+                            if matches!(
+                                guard.as_ref(),
+                                Some(ScanSession::Ble { id, .. }) if *id == session_id
+                            ) {
                                 guard.take();
                             }
                             return;
                         }
                     };
-                    let fut = async move {
-                        let mut known_addrs = HashSet::<String>::new();
 
-                        while let Some(dev) = stream.next().await {
-                            let name = dev.device.name().unwrap_or_default().to_string();
-                            let raw_addr = dev.device.id().to_string();
-                            let key = normalize_addr_for_dedup(&raw_addr);
-                            if key.is_empty() {
-                                continue;
+                    loop {
+                        tokio::select! {
+                            _ = &mut cancel_rx => {
+                                break;
                             }
-                            if known_addrs.insert(key) {
-                                #[cfg(not(target_os = "android"))]
-                                scanned_devices
-                                    .lock()
-                                    .unwrap()
-                                    .insert(raw_addr.clone(), dev.device.clone());
-                                results.lock().unwrap().push(BluetoothDevice {
-                                    name: name.clone(),
-                                    addr: raw_addr.clone(),
-                                });
-                                let _ = channel_clone.send(BluetoothDevice {
-                                    name,
-                                    addr: raw_addr,
-                                });
+                            maybe_dev = stream.next() => {
+                                match maybe_dev {
+                                    Some(dev) => {
+                                        let name = dev.device.name().unwrap_or_default().to_string();
+                                        let raw_addr = dev.device.id().to_string();
+                                        let key = normalize_addr_for_dedup(&raw_addr);
+                                        if key.is_empty() {
+                                            continue;
+                                        }
+                                        if known_addrs.insert(key) {
+                                            scanned_devices
+                                                .lock()
+                                                .unwrap()
+                                                .insert(raw_addr.clone(), dev.device.clone());
+                                            results.lock().unwrap().push(BluetoothDevice {
+                                                name: name.clone(),
+                                                addr: raw_addr.clone(),
+                                            });
+                                            let _ = channel_clone.send(BluetoothDevice {
+                                                name,
+                                                addr: raw_addr,
+                                            });
+                                        }
+                                    }
+                                    None => break,
+                                }
                             }
                         }
-                    };
-                    let _ = Abortable::new(fut, abort_reg).await;
-                    send_finish(&mut finish_tx);
+                    }
+
+                    if let Some(tx) = finish_tx.take() {
+                        let _ = tx.send(());
+                    }
+
                     let mut guard = scan_state.lock().unwrap();
-                    if guard.as_ref().map(|s| s.id) == Some(session_id) {
+                    if matches!(
+                        guard.as_ref(),
+                        Some(ScanSession::Ble { id, .. }) if *id == session_id
+                    ) {
                         guard.take();
                     }
                 });
@@ -451,9 +508,27 @@ impl BluetoothInterface for StdImp {
                     let mut guard = self.scan_state.lock().unwrap();
                     guard.take()
                 };
-                let was_scanning = session.is_some();
+                let mut was_scanning = false;
                 if let Some(session) = session {
-                    session.abort_handle.abort();
+                    match session {
+                        ScanSession::Spp { abort_handle, .. } => {
+                            was_scanning = true;
+                            abort_handle.abort();
+                        }
+                        ScanSession::Ble {
+                            cancel_tx,
+                            finished_rx,
+                            ..
+                        } => {
+                            #[cfg(not(target_os = "android"))]
+                            let _ = tauri::async_runtime::block_on(Self::shutdown_ble_scan(
+                                cancel_tx,
+                                finished_rx,
+                            ));
+                            #[cfg(target_os = "android")]
+                            let _ = (cancel_tx, finished_rx);
+                        }
+                    }
                 }
                 let app = Self::app().ok_or(ScanError::AdapterNotFound)?;
                 let spp = app.btclassic_spp();
@@ -485,17 +560,27 @@ impl BluetoothInterface for StdImp {
                 Ok(out)
             }
             ConnectType::BLE => {
-                let mut session = {
+                if let Some(session) = {
                     let mut guard = self.scan_state.lock().unwrap();
                     guard.take()
-                };
-                if let Some(ref mut session) = session {
-                    session.abort_handle.abort();
-                    if let Some(finished) = session.finished.take() {
-                        let wait = async move {
-                            let _ = tokio::time::timeout(Duration::from_secs(2), finished).await;
-                        };
-                        let _ = tauri::async_runtime::block_on(wait);
+                } {
+                    match session {
+                        ScanSession::Spp { abort_handle, .. } => {
+                            abort_handle.abort();
+                        }
+                        ScanSession::Ble {
+                            cancel_tx,
+                            finished_rx,
+                            ..
+                        } => {
+                            #[cfg(not(target_os = "android"))]
+                            let _ = tauri::async_runtime::block_on(Self::shutdown_ble_scan(
+                                cancel_tx,
+                                finished_rx,
+                            ));
+                            #[cfg(target_os = "android")]
+                            let _ = (cancel_tx, finished_rx);
+                        }
                     }
                 }
                 Ok(self.scan_results.lock().unwrap().drain(..).collect())
