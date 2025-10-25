@@ -312,6 +312,12 @@ impl StdImp {
 
 impl BluetoothInterface for StdImp {
     fn start_scan(&self, channel: tauri::ipc::Channel<BluetoothDevice>) -> Result<(), ScanError> {
+        log::debug!(
+            "StdImp::start_scan invoked for {:?}; current scan_state active={} (linux={})",
+            self.connect_type,
+            self.scan_state.lock().unwrap().is_some(),
+            cfg!(target_os = "linux")
+        );
         match self.connect_type {
             ConnectType::SPP => {
                 let app = Self::app().ok_or(ScanError::AdapterNotFound)?;
@@ -376,6 +382,10 @@ impl BluetoothInterface for StdImp {
 
             #[cfg(not(target_os = "android"))]
             ConnectType::BLE => tauri::async_runtime::block_on(async {
+                log::debug!(
+                    "StdImp::start_scan (BLE) preparing new scan session; previous state cleared={}",
+                    self.scan_state.lock().unwrap().is_none()
+                );
                 if let Some(session) = {
                     let mut guard = self.scan_state.lock().unwrap();
                     guard.take()
@@ -401,10 +411,15 @@ impl BluetoothInterface for StdImp {
 
                 #[cfg(target_os = "linux")]
                 if let Some(app) = Self::app() {
+                    log::debug!("StdImp::start_scan (BLE, linux) ensuring btclassic-spp scan stopped before BLE discovery");
                     if let Err(err) = app.btclassic_spp().stop_scan() {
                         log::debug!(
                             "StdImp::start_scan (BLE, linux) pre-emptively stopped SPP scan: {}",
                             err
+                        );
+                    } else {
+                        log::debug!(
+                            "StdImp::start_scan (BLE, linux) btclassic-spp stop_scan returned success"
                         );
                     }
                 }
@@ -451,6 +466,14 @@ impl BluetoothInterface for StdImp {
                         Err(mut err) => loop {
                             #[cfg(not(target_os = "android"))]
                             {
+                                let err_kind = err.kind();
+                                let err_msg = err.message().to_string();
+                                log::debug!(
+                                    "StdImp::start_scan (BLE) scan attempt {} returned error kind={:?} message='{}'",
+                                    retry_index + 1,
+                                    err_kind,
+                                    err_msg
+                                );
                                 if err.kind() == BluestErrorKind::AlreadyScanning
                                     && retry_index < BLE_SCAN_RETRY_LIMIT
                                 {
@@ -475,8 +498,10 @@ impl BluetoothInterface for StdImp {
                             }
                             let attempts = retry_index + 1;
                             log::warn!(
-                                "StdImp::start_scan (BLE) failed to start discovery after {} attempt(s): {}",
+                                "StdImp::start_scan (BLE) failed to start discovery after {} attempt(s): kind={:?}, message='{}', display={}",
                                 attempts,
+                                err.kind(),
+                                err.message(),
                                 err
                             );
                             if let Some(tx) = finish_tx.take() {
