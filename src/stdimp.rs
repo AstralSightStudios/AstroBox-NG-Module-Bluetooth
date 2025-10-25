@@ -6,6 +6,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(target_os = "android")]
 use crate::btinterface::ble_stub::{Adapter, BluestDevice, BluestService, Characteristic};
@@ -20,6 +21,7 @@ use futures_util::{
     StreamExt,
     future::{AbortHandle, Abortable},
 };
+use tokio::sync::oneshot;
 use tauri::{AppHandle, Wry};
 
 use crate::btinterface::{
@@ -80,7 +82,8 @@ pub struct StdImp {
     #[cfg(not(target_os = "android"))]
     ble_scanned_devices: Arc<Mutex<HashMap<String, BluestDevice>>>,
     ble_on_connected: Mutex<Option<Arc<dyn Fn() + Send + Sync + 'static>>>,
-    scan_abort: Mutex<Option<AbortHandle>>,
+    scan_state: Arc<Mutex<Option<ScanSession>>>,
+    scan_seq: AtomicUsize,
     scan_results: Arc<Mutex<Vec<BluetoothDevice>>>,
 }
 
@@ -99,6 +102,12 @@ struct BleCharacteristicBundle {
     sent: Option<Uuid>,
 }
 
+struct ScanSession {
+    id: usize,
+    abort_handle: AbortHandle,
+    finished: Option<oneshot::Receiver<()>>,
+}
+
 impl StdImp {
     pub fn new(connect_type: ConnectType) -> Self {
         Self {
@@ -110,7 +119,8 @@ impl StdImp {
             #[cfg(not(target_os = "android"))]
             ble_scanned_devices: Arc::new(Mutex::new(HashMap::new())),
             ble_on_connected: Mutex::new(None),
-            scan_abort: Mutex::new(None),
+            scan_state: Arc::new(Mutex::new(None)),
+            scan_seq: AtomicUsize::new(0),
             scan_results: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -282,17 +292,23 @@ impl BluetoothInterface for StdImp {
             ConnectType::SPP => {
                 let app = Self::app().ok_or(ScanError::AdapterNotFound)?;
 
-                let abort_reg = {
-                    let mut guard = self.scan_abort.lock().unwrap();
+                let (abort_reg, session_id) = {
+                    let mut guard = self.scan_state.lock().unwrap();
                     if guard.is_some() {
                         return Ok(());
                     }
+                    let session_id = self.scan_seq.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
                     let (abort_handle, abort_reg) = AbortHandle::new_pair();
-                    *guard = Some(abort_handle);
-                    abort_reg
+                    *guard = Some(ScanSession {
+                        id: session_id,
+                        abort_handle,
+                        finished: None,
+                    });
+                    (abort_reg, session_id)
                 };
 
                 let app_handle = app.clone();
+                let scan_state = Arc::clone(&self.scan_state);
                 tauri::async_runtime::spawn(async move {
                     let fut = async move {
                         let mut known_addrs = HashSet::<String>::new();
@@ -317,6 +333,10 @@ impl BluetoothInterface for StdImp {
                         }
                     };
                     let _ = Abortable::new(fut, abort_reg).await;
+                    let mut guard = scan_state.lock().unwrap();
+                    if guard.as_ref().map(|s| s.id) == Some(session_id) {
+                        guard.take();
+                    }
                 });
 
                 app.btclassic_spp()
@@ -328,8 +348,8 @@ impl BluetoothInterface for StdImp {
             #[cfg(not(target_os = "android"))]
             ConnectType::BLE => tauri::async_runtime::block_on(async {
                 {
-                    let abort_guard = self.scan_abort.lock().unwrap();
-                    if abort_guard.is_some() {
+                    let guard = self.scan_state.lock().unwrap();
+                    if guard.is_some() {
                         return Ok(());
                     }
                 }
@@ -343,16 +363,44 @@ impl BluetoothInterface for StdImp {
                 self.ble_scanned_devices.lock().unwrap().clear();
 
                 let results = self.scan_results.clone();
+                let session_id = self.scan_seq.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
                 let (abort_handle, abort_reg) = AbortHandle::new_pair();
-                *self.scan_abort.lock().unwrap() = Some(abort_handle);
+                let (finished_tx, finished_rx) = oneshot::channel();
+                {
+                    let mut guard = self.scan_state.lock().unwrap();
+                    *guard = Some(ScanSession {
+                        id: session_id,
+                        abort_handle,
+                        finished: Some(finished_rx),
+                    });
+                }
 
+                let scan_state = Arc::clone(&self.scan_state);
                 let channel_clone = channel.clone();
                 #[cfg(not(target_os = "android"))]
                 let scanned_devices = Arc::clone(&self.ble_scanned_devices);
                 tauri::async_runtime::spawn(async move {
+                    let mut finish_tx = Some(finished_tx);
+                    let mut send_finish = |sender: &mut Option<oneshot::Sender<()>>| {
+                        if let Some(sender) = sender.take() {
+                            let _ = sender.send(());
+                        }
+                    };
+
                     let mut stream = match adapter.scan(&[]).await {
                         Ok(s) => s,
-                        Err(_) => return,
+                        Err(err) => {
+                            log::warn!(
+                                "StdImp::start_scan (BLE) failed to start discovery: {}",
+                                err
+                            );
+                            send_finish(&mut finish_tx);
+                            let mut guard = scan_state.lock().unwrap();
+                            if guard.as_ref().map(|s| s.id) == Some(session_id) {
+                                guard.take();
+                            }
+                            return;
+                        }
                     };
                     let fut = async move {
                         let mut known_addrs = HashSet::<String>::new();
@@ -382,6 +430,11 @@ impl BluetoothInterface for StdImp {
                         }
                     };
                     let _ = Abortable::new(fut, abort_reg).await;
+                    send_finish(&mut finish_tx);
+                    let mut guard = scan_state.lock().unwrap();
+                    if guard.as_ref().map(|s| s.id) == Some(session_id) {
+                        guard.take();
+                    }
                 });
                 Ok(())
             }),
@@ -394,7 +447,14 @@ impl BluetoothInterface for StdImp {
     fn stop_scan(&self) -> Result<Vec<BluetoothDevice>, ScanError> {
         match self.connect_type {
             ConnectType::SPP => {
-                let was_scanning = self.scan_abort.lock().unwrap().take().is_some();
+                let session = {
+                    let mut guard = self.scan_state.lock().unwrap();
+                    guard.take()
+                };
+                let was_scanning = session.is_some();
+                if let Some(session) = session {
+                    session.abort_handle.abort();
+                }
                 let app = Self::app().ok_or(ScanError::AdapterNotFound)?;
                 let spp = app.btclassic_spp();
 
@@ -425,8 +485,18 @@ impl BluetoothInterface for StdImp {
                 Ok(out)
             }
             ConnectType::BLE => {
-                if let Some(handle) = self.scan_abort.lock().unwrap().take() {
-                    handle.abort();
+                let mut session = {
+                    let mut guard = self.scan_state.lock().unwrap();
+                    guard.take()
+                };
+                if let Some(ref mut session) = session {
+                    session.abort_handle.abort();
+                    if let Some(finished) = session.finished.take() {
+                        let wait = async move {
+                            let _ = tokio::time::timeout(Duration::from_secs(2), finished).await;
+                        };
+                        let _ = tauri::async_runtime::block_on(wait);
+                    }
                 }
                 Ok(self.scan_results.lock().unwrap().drain(..).collect())
             }
