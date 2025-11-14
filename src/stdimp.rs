@@ -411,7 +411,9 @@ impl BluetoothInterface for StdImp {
 
                 #[cfg(target_os = "linux")]
                 if let Some(app) = Self::app() {
-                    log::info!("StdImp::start_scan (BLE, linux) ensuring btclassic-spp scan stopped before BLE discovery");
+                    log::info!(
+                        "StdImp::start_scan (BLE, linux) ensuring btclassic-spp scan stopped before BLE discovery"
+                    );
                     if let Err(err) = app.btclassic_spp().stop_scan() {
                         log::info!(
                             "StdImp::start_scan (BLE, linux) pre-emptively stopped SPP scan: {}",
