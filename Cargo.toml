@@ -9,7 +9,7 @@ btclassic-spp = { path = "../../plugins/btclassic-spp" }
 # 这里引入tauri作为依赖只是用一下它的类型
 # 如果你正在为单片机做porting，且不需要用btclassic-spp，请一并删掉该依赖
 # 该依赖的版本需要与app的tauri版本同步
-tauri = { version = "2.9.2", features = [] }
+tauri = { version = "2.9.2", features = ["rustls-tls"] }
 bluest = { version = "0.6.9", features = ["unstable"] }
 futures-util = "0.3"
 tokio = "1.48.0"
