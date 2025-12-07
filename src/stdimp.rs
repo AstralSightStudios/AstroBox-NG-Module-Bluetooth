@@ -308,6 +308,101 @@ impl StdImp {
         self.ble_chara_cache.lock().unwrap().clear();
         *self.ble_char_bundle.lock().unwrap() = None;
     }
+
+    #[cfg(target_os = "ios")]
+    async fn ble_probe_connected_device_by_addr(
+        &self,
+        adapter: &Adapter,
+        addr: &str,
+    ) -> Option<BluestDevice> {
+        let normalized_target = normalize_addr_for_dedup(addr);
+        match adapter.connected_devices().await {
+            Ok(devices) => {
+                for dev in devices {
+                    let id = dev.id().to_string();
+                    let normalized_id = normalize_addr_for_dedup(&id);
+                    if id.eq_ignore_ascii_case(addr)
+                        || (!normalized_target.is_empty()
+                            && !normalized_id.is_empty()
+                            && normalized_id.eq_ignore_ascii_case(&normalized_target))
+                    {
+                        log::info!(
+                            "StdImp::ble_probe_connected_device_by_addr reusing already-connected peripheral: addr={} (matched id={})",
+                            addr,
+                            id
+                        );
+                        return Some(dev);
+                    }
+                }
+                None
+            }
+            Err(err) => {
+                log::warn!(
+                    "StdImp::ble_probe_connected_device_by_addr failed to query connected devices: {}",
+                    err
+                );
+                None
+            }
+        }
+    }
+
+    #[cfg(target_os = "ios")]
+    async fn ble_seed_scan_with_connected(
+        &self,
+        adapter: &Adapter,
+        channel: &tauri::ipc::Channel<BluetoothDevice>,
+    ) {
+        match adapter.connected_devices().await {
+            Ok(devices) => {
+                for dev in devices {
+                    let addr = dev.id().to_string();
+                    let key = normalize_addr_for_dedup(&addr);
+                    if key.is_empty() {
+                        continue;
+                    }
+
+                    let mut cache = self.ble_scanned_devices.lock().unwrap();
+                    if cache.contains_key(&addr) {
+                        continue;
+                    }
+
+                    let name = dev.name().unwrap_or_else(|err| {
+                        log::debug!(
+                            "StdImp::ble_seed_scan_with_connected failed to read device name for {}: {}",
+                            addr,
+                            err
+                        );
+                        String::new()
+                    });
+
+                    cache.insert(addr.clone(), dev.clone());
+                    drop(cache);
+
+                    self.scan_results.lock().unwrap().push(BluetoothDevice {
+                        name: name.clone(),
+                        addr: addr.clone(),
+                    });
+
+                    if let Err(err) = channel.send(BluetoothDevice {
+                        name,
+                        addr: addr.clone(),
+                    }) {
+                        log::debug!(
+                            "StdImp::ble_seed_scan_with_connected failed to push connected device {}: {:?}",
+                            addr,
+                            err
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                log::warn!(
+                    "StdImp::ble_seed_scan_with_connected failed to query connected devices: {}",
+                    err
+                );
+            }
+        }
+    }
 }
 
 impl BluetoothInterface for StdImp {
@@ -429,6 +524,11 @@ impl BluetoothInterface for StdImp {
                 self.scan_results.lock().unwrap().clear();
                 self.ble_scanned_devices.lock().unwrap().clear();
 
+                #[cfg(target_os = "ios")]
+                {
+                    self.ble_seed_scan_with_connected(adapter, &channel).await;
+                }
+
                 let session_id = self
                     .scan_seq
                     .fetch_add(1, Ordering::Relaxed)
@@ -450,11 +550,18 @@ impl BluetoothInterface for StdImp {
                 let channel_clone = channel.clone();
                 let scanned_devices = Arc::clone(&self.ble_scanned_devices);
                 let adapter_clone = adapter.clone();
+                let preknown_addrs: HashSet<String> = self
+                    .ble_scanned_devices
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect();
 
                 tauri::async_runtime::spawn(async move {
                     let mut cancel_rx = cancel_rx;
                     let mut finish_tx = Some(finished_tx);
-                    let mut known_addrs = HashSet::<String>::new();
+                    let mut known_addrs = preknown_addrs;
 
                     #[cfg(not(target_os = "android"))]
                     const BLE_SCAN_RETRY_LIMIT: usize = 6;
@@ -684,6 +791,19 @@ impl BluetoothInterface for StdImp {
                     map.get(&addr).cloned()
                 };
 
+                #[cfg(target_os = "ios")]
+                if device_opt.is_none() {
+                    device_opt = self
+                        .ble_probe_connected_device_by_addr(adapter, &addr)
+                        .await;
+                    if let Some(dev) = &device_opt {
+                        self.ble_scanned_devices
+                            .lock()
+                            .unwrap()
+                            .insert(addr.clone(), dev.clone());
+                    }
+                }
+
                 if device_opt.is_none() {
                     log::debug!(
                         "StdImp::connect (BLE) cache miss for addr={}, starting on-demand scan",
@@ -717,14 +837,26 @@ impl BluetoothInterface for StdImp {
                     addr
                 );
 
-                adapter
-                    .connect_device(&device)
-                    .await
-                    .map_err(|_| ConnectError::TargetRejected)?;
-                log::info!(
-                    "StdImp::connect (BLE) controller connection established addr={}",
-                    addr
-                );
+                #[cfg(target_os = "ios")]
+                let already_connected = device.is_connected().await;
+                #[cfg(not(target_os = "ios"))]
+                let already_connected = false;
+
+                if !already_connected {
+                    adapter
+                        .connect_device(&device)
+                        .await
+                        .map_err(|_| ConnectError::TargetRejected)?;
+                    log::info!(
+                        "StdImp::connect (BLE) controller connection established addr={}",
+                        addr
+                    );
+                } else {
+                    log::info!(
+                        "StdImp::connect (BLE) controller already connected at system level addr={}",
+                        addr
+                    );
+                }
 
                 let mut attempts = 0;
                 while !device.is_connected().await {
