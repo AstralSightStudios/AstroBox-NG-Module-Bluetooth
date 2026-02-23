@@ -774,7 +774,7 @@ impl BluetoothInterface for StdImp {
             ConnectType::SPP => {
                 let app = Self::app().ok_or(ConnectError::DeviceNotFound)?;
                 let spp = app.btclassic_spp();
-                match spp.connect(&addr, false) {
+                match spp.connect(&addr, true) {
                     Ok(res) if res.ret => Ok(()),
                     Ok(_) => Err(ConnectError::TargetRejected),
                     Err(_) => Err(ConnectError::DeviceNotFound),
