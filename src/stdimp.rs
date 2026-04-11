@@ -939,6 +939,32 @@ impl BluetoothInterface for StdImp {
         }
     }
 
+    fn max_send_len(&self, characteristic: Option<Uuid>) -> Option<usize> {
+        match self.connect_type {
+            ConnectType::SPP => {
+                let app = Self::app()?;
+                app.btclassic_spp()
+                    .get_max_send_len()
+                    .ok()
+                    .flatten()
+                    .filter(|len| *len > 0)
+            }
+
+            #[cfg(not(target_os = "android"))]
+            ConnectType::BLE => {
+                let uuid = characteristic.or_else(|| self.ble_default_sent_uuid())?;
+                tauri::async_runtime::block_on(async {
+                    let chara = self.ble_get_or_discover_chara(uuid).await.ok()?;
+                    chara.max_write_len_async().await.ok()
+                })
+                .filter(|len| *len > 0)
+            }
+
+            #[cfg(target_os = "android")]
+            ConnectType::BLE => None,
+        }
+    }
+
     fn send(&self, data: Vec<u8>, characteristic: Option<Uuid>) -> Result<(), SendError> {
         match self.connect_type {
             ConnectType::SPP => {

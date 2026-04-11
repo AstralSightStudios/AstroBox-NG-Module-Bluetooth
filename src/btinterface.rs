@@ -112,6 +112,10 @@ pub trait BluetoothInterface: Send + Sync + Debug {
     fn stop_scan(&self) -> Result<Vec<BluetoothDevice>, ScanError>;
     fn connect(&self, addr: String) -> Result<(), ConnectError>;
     fn set_on_connected_listener(&self, cb: Arc<dyn Fn() + Send + Sync + 'static>);
+    fn max_send_len(&self, characteristic: Option<Uuid>) -> Option<usize> {
+        let _ = characteristic;
+        None
+    }
     fn send(&self, data: Vec<u8>, characteristic: Option<Uuid>) -> Result<(), SendError>;
     fn subscribe(
         &self,
