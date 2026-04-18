@@ -25,7 +25,7 @@ use futures_util::{
     future::{AbortHandle, Abortable},
 };
 use tauri::{AppHandle, Wry};
-use tokio::sync::oneshot;
+use tokio::sync::{Mutex as AsyncMutex, oneshot};
 
 use crate::btinterface::{
     BluetoothDevice, BluetoothInterface, ConnectError, ConnectType, DisconnectError, ScanError,
@@ -82,6 +82,7 @@ pub struct StdImp {
     ble_services: Mutex<Option<Vec<BluestService>>>,
     ble_chara_cache: Mutex<HashMap<Uuid, Characteristic>>,
     ble_char_bundle: Mutex<Option<BleCharacteristicBundle>>,
+    ble_send_lock: AsyncMutex<()>,
     #[cfg(not(target_os = "android"))]
     ble_scanned_devices: Arc<Mutex<HashMap<String, BluestDevice>>>,
     ble_on_connected: Mutex<Option<Arc<dyn Fn() + Send + Sync + 'static>>>,
@@ -126,6 +127,7 @@ impl StdImp {
             ble_services: Mutex::new(None),
             ble_chara_cache: Mutex::new(HashMap::new()),
             ble_char_bundle: Mutex::new(None),
+            ble_send_lock: AsyncMutex::new(()),
             #[cfg(not(target_os = "android"))]
             ble_scanned_devices: Arc::new(Mutex::new(HashMap::new())),
             ble_on_connected: Mutex::new(None),
@@ -307,6 +309,51 @@ impl StdImp {
         *self.ble_services.lock().unwrap() = None;
         self.ble_chara_cache.lock().unwrap().clear();
         *self.ble_char_bundle.lock().unwrap() = None;
+    }
+
+    #[cfg(not(target_os = "android"))]
+    async fn ble_send_impl(
+        &self,
+        data: Vec<u8>,
+        characteristic: Option<Uuid>,
+    ) -> Result<(), SendError> {
+        self.ble_send_many_impl(vec![data], characteristic).await
+    }
+
+    #[cfg(not(target_os = "android"))]
+    async fn ble_send_many_impl(
+        &self,
+        data: Vec<Vec<u8>>,
+        characteristic: Option<Uuid>,
+    ) -> Result<(), SendError> {
+        let _send_guard = self.ble_send_lock.lock().await;
+        let uuid = match characteristic {
+            Some(uuid) => uuid,
+            None => self
+                .ble_default_sent_uuid()
+                .ok_or(SendError::BleCharaNotFound)?,
+        };
+
+        if self.ble_device.lock().unwrap().is_none() {
+            return Err(SendError::Disconnected);
+        }
+
+        let chara = self
+            .ble_get_or_discover_chara(uuid)
+            .await
+            .map_err(|e| match e {
+                SubscribeError::BleCharaNotFound => SendError::BleCharaNotFound,
+                _ => SendError::Disconnected,
+            })?;
+
+        for item in data {
+            chara
+                .write_without_response(&item)
+                .await
+                .map_err(|_| SendError::Disconnected)?;
+        }
+
+        Ok(())
     }
 
     #[cfg(target_os = "ios")]
@@ -975,40 +1022,45 @@ impl BluetoothInterface for StdImp {
             }
 
             #[cfg(not(target_os = "android"))]
-            ConnectType::BLE => {
-                let uuid = match characteristic {
-                    Some(uuid) => uuid,
-                    None => self
-                        .ble_default_sent_uuid()
-                        .ok_or(SendError::BleCharaNotFound)?,
-                };
-                tauri::async_runtime::block_on(async {
-                    log::debug!(
-                        "StdImp::send (BLE) writing {} bytes to char {}",
-                        data.len(),
-                        uuid
-                    );
-                    if self.ble_device.lock().unwrap().is_none() {
-                        return Err(SendError::Disconnected);
-                    }
-
-                    let chara =
-                        self.ble_get_or_discover_chara(uuid)
-                            .await
-                            .map_err(|e| match e {
-                                SubscribeError::BleCharaNotFound => SendError::BleCharaNotFound,
-                                _ => SendError::Disconnected,
-                            })?;
-
-                    chara
-                        .write_without_response(&data)
-                        .await
-                        .map_err(|_| SendError::Disconnected)
-                })
-            }
+            ConnectType::BLE => tauri::async_runtime::block_on(self.ble_send_impl(data, characteristic)),
 
             #[cfg(target_os = "android")]
             ConnectType::BLE => Err(SendError::Disconnected),
+        }
+    }
+
+    fn send_async(
+        &self,
+        data: Vec<u8>,
+        characteristic: Option<Uuid>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SendError>> + Send + '_>>
+    {
+        match self.connect_type {
+            ConnectType::SPP => Box::pin(async move { self.send(data, characteristic) }),
+            #[cfg(not(target_os = "android"))]
+            ConnectType::BLE => Box::pin(self.ble_send_impl(data, characteristic)),
+            #[cfg(target_os = "android")]
+            ConnectType::BLE => Box::pin(async { Err(SendError::Disconnected) }),
+        }
+    }
+
+    fn send_many_async(
+        &self,
+        data: Vec<Vec<u8>>,
+        characteristic: Option<Uuid>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SendError>> + Send + '_>>
+    {
+        match self.connect_type {
+            ConnectType::SPP => Box::pin(async move {
+                for item in data {
+                    self.send(item, characteristic)?;
+                }
+                Ok(())
+            }),
+            #[cfg(not(target_os = "android"))]
+            ConnectType::BLE => Box::pin(self.ble_send_many_impl(data, characteristic)),
+            #[cfg(target_os = "android")]
+            ConnectType::BLE => Box::pin(async { Err(SendError::Disconnected) }),
         }
     }
 

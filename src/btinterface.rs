@@ -1,6 +1,8 @@
 use bluest::Uuid;
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 use std::fmt::{self, Debug, Display};
+use std::pin::Pin;
 use std::sync::Arc;
 use tauri::ipc::Channel;
 
@@ -117,6 +119,25 @@ pub trait BluetoothInterface: Send + Sync + Debug {
         None
     }
     fn send(&self, data: Vec<u8>, characteristic: Option<Uuid>) -> Result<(), SendError>;
+    fn send_async(
+        &self,
+        data: Vec<u8>,
+        characteristic: Option<Uuid>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SendError>> + Send + '_>> {
+        Box::pin(async move { self.send(data, characteristic) })
+    }
+    fn send_many_async(
+        &self,
+        data: Vec<Vec<u8>>,
+        characteristic: Option<Uuid>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SendError>> + Send + '_>> {
+        Box::pin(async move {
+            for item in data {
+                self.send_async(item, characteristic).await?;
+            }
+            Ok(())
+        })
+    }
     fn subscribe(
         &self,
         cb: Arc<dyn Fn(Result<Vec<u8>, String>) + Send + Sync>,
