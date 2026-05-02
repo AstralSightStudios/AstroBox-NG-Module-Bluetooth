@@ -1022,9 +1022,7 @@ impl BluetoothInterface for StdImp {
             }
 
             #[cfg(not(target_os = "android"))]
-            ConnectType::BLE => {
-                tauri::async_runtime::block_on(self.ble_send_impl(data, characteristic))
-            }
+            ConnectType::BLE => tauri::async_runtime::block_on(self.ble_send_impl(data, characteristic)),
 
             #[cfg(target_os = "android")]
             ConnectType::BLE => Err(SendError::Disconnected),
