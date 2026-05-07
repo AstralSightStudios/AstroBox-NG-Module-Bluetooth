@@ -35,6 +35,9 @@ use crate::btinterface::{
 const BLE_UUID_KEYWORD_XIAOMI_SERVICE: &str = "0050";
 const BLE_UUID_KEYWORD_XIAOMI_SENT: &str = "005f";
 const BLE_UUID_KEYWORD_XIAOMI_RECV: &str = "005e";
+const BLE_UUID_VIVO_SERVICE: &str = "0000276008c211e190730e8ac72e1011";
+const BLE_UUID_VIVO_SENT: &str = "0000276008c211e190730e8ac72e0011";
+const BLE_UUID_VIVO_RECV: &str = "0000276008c211e190730e8ac72e0012";
 
 static APP_HANDLE: OnceLock<AppHandle<Wry>> = OnceLock::new();
 
@@ -186,6 +189,16 @@ impl StdImp {
         haystack.contains(&lowered_needle)
     }
 
+    fn uuid_compact_eq(uuid: &Uuid, expected: &str) -> bool {
+        let haystack: String = uuid
+            .to_string()
+            .chars()
+            .filter(|c| *c != '-')
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        haystack == expected.to_ascii_lowercase()
+    }
+
     fn ble_default_recv_uuid(&self) -> Option<Uuid> {
         self.ble_char_bundle
             .lock()
@@ -251,7 +264,7 @@ impl StdImp {
     }
 
     #[cfg(not(target_os = "android"))]
-    async fn ble_extract_xiaomi_characteristics(
+    async fn ble_extract_default_characteristics(
         &self,
         services: &[BluestService],
     ) -> Result<(), ConnectError> {
@@ -259,7 +272,9 @@ impl StdImp {
 
         for svc in services {
             let svc_uuid = svc.uuid();
-            if !Self::uuid_contains(&svc_uuid, "fe95") {
+            let is_xiaomi = Self::uuid_contains(&svc_uuid, "fe95");
+            let is_vivo = Self::uuid_compact_eq(&svc_uuid, BLE_UUID_VIVO_SERVICE);
+            if !is_xiaomi && !is_vivo {
                 continue;
             }
 
@@ -270,24 +285,37 @@ impl StdImp {
 
             for c in chars {
                 let cuuid = c.uuid();
-                if Self::uuid_contains(&cuuid, BLE_UUID_KEYWORD_XIAOMI_RECV) {
+                if is_xiaomi && Self::uuid_contains(&cuuid, BLE_UUID_KEYWORD_XIAOMI_RECV) {
                     log::debug!(
-                        "StdImp::ble_extract_xiaomi_characteristics detected recv characteristic {}",
+                        "StdImp::ble_extract_default_characteristics detected Xiaomi recv characteristic {}",
                         cuuid
                     );
                     bundle.recv = Some(cuuid);
-                } else if Self::uuid_contains(&cuuid, BLE_UUID_KEYWORD_XIAOMI_SENT) {
+                } else if is_xiaomi && Self::uuid_contains(&cuuid, BLE_UUID_KEYWORD_XIAOMI_SENT) {
                     log::debug!(
-                        "StdImp::ble_extract_xiaomi_characteristics detected sent characteristic {}",
+                        "StdImp::ble_extract_default_characteristics detected Xiaomi sent characteristic {}",
                         cuuid
                     );
                     bundle.sent = Some(cuuid);
-                } else if Self::uuid_contains(&cuuid, BLE_UUID_KEYWORD_XIAOMI_SERVICE) {
+                } else if is_xiaomi && Self::uuid_contains(&cuuid, BLE_UUID_KEYWORD_XIAOMI_SERVICE)
+                {
                     log::debug!(
-                        "StdImp::ble_extract_xiaomi_characteristics detected service characteristic {}",
+                        "StdImp::ble_extract_default_characteristics detected Xiaomi service characteristic {}",
                         cuuid
                     );
                     bundle.service = Some(cuuid);
+                } else if is_vivo && Self::uuid_compact_eq(&cuuid, BLE_UUID_VIVO_RECV) {
+                    log::debug!(
+                        "StdImp::ble_extract_default_characteristics detected vivo notify characteristic {}",
+                        cuuid
+                    );
+                    bundle.recv = Some(cuuid);
+                } else if is_vivo && Self::uuid_compact_eq(&cuuid, BLE_UUID_VIVO_SENT) {
+                    log::debug!(
+                        "StdImp::ble_extract_default_characteristics detected vivo write characteristic {}",
+                        cuuid
+                    );
+                    bundle.sent = Some(cuuid);
                 }
                 self.ble_chara_cache
                     .lock()
@@ -943,7 +971,7 @@ impl BluetoothInterface for StdImp {
                 self.ble_chara_cache.lock().unwrap().clear();
                 self.ble_char_bundle.lock().unwrap().take();
 
-                self.ble_extract_xiaomi_characteristics(&services).await?;
+                self.ble_extract_default_characteristics(&services).await?;
 
                 *self.ble_device.lock().unwrap() = Some(device);
                 *self.ble_services.lock().unwrap() = Some(services);
