@@ -103,14 +103,30 @@ pub enum ConnectType {
     BLE = 1,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct BluetoothDevice {
     pub name: String,
     pub addr: String,
+    #[serde(
+        default,
+        rename = "connectType",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub connect_type: Option<ConnectType>,
 }
 
 pub trait BluetoothInterface: Send + Sync + Debug {
-    fn start_scan(&self, channel: Channel<BluetoothDevice>) -> Result<(), ScanError>;
+    fn set_connect_type(&self, connect_type: ConnectType) {
+        let _ = connect_type;
+    }
+    fn set_spp_fallback_channels(&self, channels: Vec<u8>) {
+        let _ = channels;
+    }
+    fn start_scan(
+        &self,
+        channel: Channel<BluetoothDevice>,
+        connect_type: Option<ConnectType>,
+    ) -> Result<(), ScanError>;
     fn stop_scan(&self) -> Result<Vec<BluetoothDevice>, ScanError>;
     fn connect(&self, addr: String) -> Result<(), ConnectError>;
     fn set_on_connected_listener(&self, cb: Arc<dyn Fn() + Send + Sync + 'static>);

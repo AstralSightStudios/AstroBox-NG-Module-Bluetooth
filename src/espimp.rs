@@ -7,7 +7,11 @@ use tauri::ipc::Channel;
 #[derive(Debug)]
 pub struct Esp32Imp;
 impl BluetoothInterface for Esp32Imp {
-    fn start_scan(&self, _channel: Channel<crate::btinterface::BluetoothDevice>) -> Result<(), crate::btinterface::ScanError> {
+    fn start_scan(
+        &self,
+        _channel: Channel<crate::btinterface::BluetoothDevice>,
+        _connect_type: Option<crate::btinterface::ConnectType>,
+    ) -> Result<(), crate::btinterface::ScanError> {
         todo!()
     }
 

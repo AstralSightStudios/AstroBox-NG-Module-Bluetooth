@@ -13,7 +13,7 @@ use crate::btinterface::ble_stub::{Adapter, BluestDevice, BluestService, Charact
 
 #[cfg(not(target_os = "android"))]
 use bluest::{
-    Adapter, Characteristic, Device as BluestDevice, Service as BluestService,
+    Adapter, AdvertisementData, Characteristic, Device as BluestDevice, Service as BluestService,
     error::ErrorKind as BluestErrorKind,
 };
 
@@ -38,6 +38,7 @@ const BLE_UUID_KEYWORD_XIAOMI_RECV: &str = "005e";
 const BLE_UUID_VIVO_SERVICE: &str = "0000276008c211e190730e8ac72e1011";
 const BLE_UUID_VIVO_SENT: &str = "0000276008c211e190730e8ac72e0011";
 const BLE_UUID_VIVO_RECV: &str = "0000276008c211e190730e8ac72e0012";
+const VIVO_MANUFACTURER_ID: u16 = 2103;
 
 static APP_HANDLE: OnceLock<AppHandle<Wry>> = OnceLock::new();
 
@@ -79,7 +80,8 @@ pub fn normalize_addr_for_dedup(raw: &str) -> String {
 }
 
 pub struct StdImp {
-    connect_type: ConnectType,
+    connect_type: Mutex<ConnectType>,
+    spp_fallback_channels: Mutex<Vec<u8>>,
 
     ble_device: Mutex<Option<BluestDevice>>,
     ble_services: Mutex<Option<Vec<BluestService>>>,
@@ -97,7 +99,7 @@ pub struct StdImp {
 impl fmt::Debug for StdImp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StdImp")
-            .field("connect_type", &self.connect_type)
+            .field("connect_type", &self.current_connect_type())
             .finish()
     }
 }
@@ -107,6 +109,14 @@ struct BleCharacteristicBundle {
     service: Option<Uuid>,
     recv: Option<Uuid>,
     sent: Option<Uuid>,
+}
+
+#[derive(Debug, Clone)]
+struct VivoAdvertisementInfo {
+    protocol_version: u8,
+    mask: u16,
+    product_id: u16,
+    mac: String,
 }
 
 #[derive(Debug)]
@@ -125,7 +135,8 @@ enum ScanSession {
 impl StdImp {
     pub fn new(connect_type: ConnectType) -> Self {
         Self {
-            connect_type,
+            connect_type: Mutex::new(connect_type),
+            spp_fallback_channels: Mutex::new(vec![5, 1]),
             ble_device: Mutex::new(None),
             ble_services: Mutex::new(None),
             ble_chara_cache: Mutex::new(HashMap::new()),
@@ -143,6 +154,58 @@ impl StdImp {
     #[inline]
     fn app() -> Option<&'static AppHandle<Wry>> {
         APP_HANDLE.get()
+    }
+
+    fn current_connect_type(&self) -> ConnectType {
+        *self.connect_type.lock().unwrap()
+    }
+
+    fn normalize_spp_fallback_channels(channels: Vec<u8>) -> Vec<u8> {
+        let source = if channels.is_empty() {
+            vec![5, 1]
+        } else {
+            channels
+        };
+
+        let mut out = Vec::new();
+        for channel in source {
+            if channel != 0 && !out.contains(&channel) {
+                out.push(channel);
+            }
+        }
+        if out.is_empty() {
+            out.extend([5, 1]);
+        }
+        out
+    }
+
+    fn current_spp_fallback_channels(&self) -> Vec<u8> {
+        self.spp_fallback_channels.lock().unwrap().clone()
+    }
+
+    fn update_connect_type(&self, connect_type: ConnectType) {
+        let mut guard = self.connect_type.lock().unwrap();
+        if *guard != connect_type {
+            log::info!(
+                "StdImp::set_connect_type switching transport {:?} -> {:?}",
+                *guard,
+                connect_type
+            );
+            *guard = connect_type;
+        }
+    }
+
+    fn update_spp_fallback_channels(&self, channels: Vec<u8>) {
+        let channels = Self::normalize_spp_fallback_channels(channels);
+        let mut guard = self.spp_fallback_channels.lock().unwrap();
+        if *guard != channels {
+            log::info!(
+                "StdImp::set_spp_fallback_channels switching {:?} -> {:?}",
+                *guard,
+                channels
+            );
+            *guard = channels;
+        }
     }
 
     #[cfg(not(target_os = "android"))]
@@ -197,6 +260,75 @@ impl StdImp {
             .map(|c| c.to_ascii_lowercase())
             .collect();
         haystack == expected.to_ascii_lowercase()
+    }
+
+    fn parse_vivo_manufacturer_data(data: &[u8]) -> Option<VivoAdvertisementInfo> {
+        if data.len() < 12 || data.first().copied() != Some(0) {
+            return None;
+        }
+
+        let protocol_version = data[1];
+        let mask = u16::from_le_bytes([data[2], data[3]]);
+        let product_id = u16::from_le_bytes([data[4], data[5]]);
+
+        let mac_bytes = &data[6..12];
+        if mac_bytes.iter().all(|b| *b == 0) {
+            return None;
+        }
+
+        let mac = mac_bytes
+            .iter()
+            .map(|b| format!("{:02X}", b))
+            .collect::<Vec<_>>()
+            .join(":");
+
+        Some(VivoAdvertisementInfo {
+            protocol_version,
+            mask,
+            product_id,
+            mac,
+        })
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn parse_vivo_advertisement(adv_data: &AdvertisementData) -> Option<VivoAdvertisementInfo> {
+        let manufacturer = adv_data.manufacturer_data.as_ref()?;
+        if manufacturer.company_id != VIVO_MANUFACTURER_ID {
+            return None;
+        }
+        Self::parse_vivo_manufacturer_data(&manufacturer.data)
+    }
+
+    fn is_vivo_watch_name(name: &str) -> bool {
+        let normalized = name.trim().to_ascii_lowercase();
+        (normalized.starts_with("vivo watch") || normalized.starts_with("iqoo watch"))
+            && !normalized.is_empty()
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn describe_manufacturer_data(adv_data: &AdvertisementData) -> String {
+        match adv_data.manufacturer_data.as_ref() {
+            Some(manufacturer) => format!(
+                "company_id={} data_len={} data={}",
+                manufacturer.company_id,
+                manufacturer.data.len(),
+                Self::hex_preview(&manufacturer.data, 24)
+            ),
+            None => "manufacturer_data=none".to_string(),
+        }
+    }
+
+    fn hex_preview(data: &[u8], limit: usize) -> String {
+        let mut out = data
+            .iter()
+            .take(limit)
+            .map(|b| format!("{:02X}", b))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if data.len() > limit {
+            out.push_str(" ...");
+        }
+        out
     }
 
     fn ble_default_recv_uuid(&self) -> Option<Uuid> {
@@ -456,11 +588,13 @@ impl StdImp {
                     self.scan_results.lock().unwrap().push(BluetoothDevice {
                         name: name.clone(),
                         addr: addr.clone(),
+                        connect_type: Some(ConnectType::BLE),
                     });
 
                     if let Err(err) = channel.send(BluetoothDevice {
                         name,
                         addr: addr.clone(),
+                        connect_type: Some(ConnectType::BLE),
                     }) {
                         log::debug!(
                             "StdImp::ble_seed_scan_with_connected failed to push connected device {}: {:?}",
@@ -481,14 +615,28 @@ impl StdImp {
 }
 
 impl BluetoothInterface for StdImp {
-    fn start_scan(&self, channel: tauri::ipc::Channel<BluetoothDevice>) -> Result<(), ScanError> {
+    fn set_connect_type(&self, connect_type: ConnectType) {
+        self.update_connect_type(connect_type);
+    }
+
+    fn set_spp_fallback_channels(&self, channels: Vec<u8>) {
+        self.update_spp_fallback_channels(channels);
+    }
+
+    fn start_scan(
+        &self,
+        channel: tauri::ipc::Channel<BluetoothDevice>,
+        connect_type: Option<ConnectType>,
+    ) -> Result<(), ScanError> {
+        let scan_connect_type = connect_type.unwrap_or_else(|| self.current_connect_type());
         log::info!(
-            "StdImp::start_scan invoked for {:?}; current scan_state active={} (linux={})",
-            self.connect_type,
+            "StdImp::start_scan invoked for {:?}; active transport={:?}; current scan_state active={} (linux={})",
+            scan_connect_type,
+            self.current_connect_type(),
             self.scan_state.lock().unwrap().is_some(),
             cfg!(target_os = "linux")
         );
-        match self.connect_type {
+        match scan_connect_type {
             ConnectType::SPP => {
                 let app = Self::app().ok_or(ScanError::AdapterNotFound)?;
 
@@ -527,6 +675,7 @@ impl BluetoothInterface for StdImp {
                                         let _ = channel.send(BluetoothDevice {
                                             name,
                                             addr: raw_addr,
+                                            connect_type: Some(ConnectType::SPP),
                                         });
                                     }
                                 }
@@ -710,24 +859,72 @@ impl BluetoothInterface for StdImp {
                             maybe_dev = stream.next() => {
                                 match maybe_dev {
                                     Some(dev) => {
-                                        let name = dev.device.name().unwrap_or_default().to_string();
+                                        let name = dev.adv_data.local_name.clone().unwrap_or_else(|| {
+                                            dev.device.name().unwrap_or_default().to_string()
+                                        });
                                         let raw_addr = dev.device.id().to_string();
-                                        let key = normalize_addr_for_dedup(&raw_addr);
+                                        let vivo_adv = StdImp::parse_vivo_advertisement(&dev.adv_data);
+
+                                        #[cfg(target_os = "ios")]
+                                        let (emit_addr, emit_connect_type) = {
+                                            if let Some(info) = &vivo_adv {
+                                                log::info!(
+                                                    "StdImp::start_scan (BLE) parsed vivo advertisement id={} mac={} product_id={} mask=0x{:04x} protocol={}",
+                                                    raw_addr,
+                                                    info.mac,
+                                                    info.product_id,
+                                                    info.mask,
+                                                    info.protocol_version
+                                                );
+                                            }
+                                            (raw_addr.clone(), ConnectType::BLE)
+                                        };
+
+                                        #[cfg(not(target_os = "ios"))]
+                                        let (emit_addr, emit_connect_type) = {
+                                            if let Some(info) = vivo_adv {
+                                                log::info!(
+                                                    "StdImp::start_scan (BLE) parsed vivo advertisement id={} mac={} product_id={} mask=0x{:04x} protocol={}, emitting SPP target",
+                                                    raw_addr,
+                                                    info.mac,
+                                                    info.product_id,
+                                                    info.mask,
+                                                    info.protocol_version
+                                                );
+                                                (info.mac, ConnectType::SPP)
+                                            } else if Self::is_vivo_watch_name(&name) {
+                                                log::warn!(
+                                                    "StdImp::start_scan (BLE) saw vivo-like device '{}' id={} but could not parse real MAC from advertisement ({}); emitting BLE fallback target",
+                                                    name,
+                                                    raw_addr,
+                                                    Self::describe_manufacturer_data(&dev.adv_data)
+                                                );
+                                                (raw_addr.clone(), ConnectType::BLE)
+                                            } else {
+                                                continue;
+                                            }
+                                        };
+
+                                        let key = normalize_addr_for_dedup(&emit_addr);
                                         if key.is_empty() {
                                             continue;
                                         }
                                         if known_addrs.insert(key) {
-                                            scanned_devices
-                                                .lock()
-                                                .unwrap()
-                                                .insert(raw_addr.clone(), dev.device.clone());
+                                            let mut cache = scanned_devices.lock().unwrap();
+                                            cache.insert(raw_addr.clone(), dev.device.clone());
+                                            if emit_addr != raw_addr {
+                                                cache.insert(emit_addr.clone(), dev.device.clone());
+                                            }
+                                            drop(cache);
                                             results.lock().unwrap().push(BluetoothDevice {
                                                 name: name.clone(),
-                                                addr: raw_addr.clone(),
+                                                addr: emit_addr.clone(),
+                                                connect_type: Some(emit_connect_type),
                                             });
                                             let _ = channel_clone.send(BluetoothDevice {
                                                 name,
-                                                addr: raw_addr,
+                                                addr: emit_addr,
+                                                connect_type: Some(emit_connect_type),
                                             });
                                         }
                                     }
@@ -758,98 +955,79 @@ impl BluetoothInterface for StdImp {
     }
 
     fn stop_scan(&self) -> Result<Vec<BluetoothDevice>, ScanError> {
-        match self.connect_type {
-            ConnectType::SPP => {
-                let session = {
-                    let mut guard = self.scan_state.lock().unwrap();
-                    guard.take()
-                };
-                let mut was_scanning = false;
-                if let Some(session) = session {
-                    match session {
-                        ScanSession::Spp { abort_handle, .. } => {
-                            was_scanning = true;
-                            abort_handle.abort();
-                        }
-                        ScanSession::Ble {
-                            cancel_tx,
-                            finished_rx,
-                            ..
-                        } => {
-                            #[cfg(not(target_os = "android"))]
-                            let _ = tauri::async_runtime::block_on(Self::shutdown_ble_scan(
-                                cancel_tx,
-                                finished_rx,
-                            ));
-                            #[cfg(target_os = "android")]
-                            let _ = (cancel_tx, finished_rx);
-                        }
-                    }
-                }
-                let app = Self::app().ok_or(ScanError::AdapterNotFound)?;
-                let spp = app.btclassic_spp();
+        let session = {
+            let mut guard = self.scan_state.lock().unwrap();
+            guard.take()
+        };
 
-                if was_scanning {
-                    let _ = spp.stop_scan().map_err(|_| ScanError::AdapterNotFound)?;
-                }
+        let stop_spp_and_collect = |was_scanning: bool| -> Result<Vec<BluetoothDevice>, ScanError> {
+            let app = Self::app().ok_or(ScanError::AdapterNotFound)?;
+            let spp = app.btclassic_spp();
 
-                let result = spp
-                    .get_scanned_devices()
-                    .map_err(|_| ScanError::AdapterNotFound)?;
-
-                let mut seen = HashSet::<String>::new();
-                let mut out = Vec::new();
-                for d in result.ret {
-                    let name = d.name.unwrap_or_default();
-                    let raw_addr = d.address;
-                    let key = normalize_addr_for_dedup(&raw_addr);
-                    if key.is_empty() {
-                        continue;
-                    }
-                    if seen.insert(key) {
-                        out.push(BluetoothDevice {
-                            name,
-                            addr: raw_addr,
-                        });
-                    }
-                }
-                Ok(out)
+            if was_scanning {
+                let _ = spp.stop_scan().map_err(|_| ScanError::AdapterNotFound)?;
             }
-            ConnectType::BLE => {
-                if let Some(session) = {
-                    let mut guard = self.scan_state.lock().unwrap();
-                    guard.take()
-                } {
-                    match session {
-                        ScanSession::Spp { abort_handle, .. } => {
-                            abort_handle.abort();
-                        }
-                        ScanSession::Ble {
-                            cancel_tx,
-                            finished_rx,
-                            ..
-                        } => {
-                            #[cfg(not(target_os = "android"))]
-                            let _ = tauri::async_runtime::block_on(Self::shutdown_ble_scan(
-                                cancel_tx,
-                                finished_rx,
-                            ));
-                            #[cfg(target_os = "android")]
-                            let _ = (cancel_tx, finished_rx);
-                        }
-                    }
+
+            let result = spp
+                .get_scanned_devices()
+                .map_err(|_| ScanError::AdapterNotFound)?;
+
+            let mut seen = HashSet::<String>::new();
+            let mut out = Vec::new();
+            for d in result.ret {
+                let name = d.name.unwrap_or_default();
+                let raw_addr = d.address;
+                let key = normalize_addr_for_dedup(&raw_addr);
+                if key.is_empty() {
+                    continue;
                 }
+                if seen.insert(key) {
+                    out.push(BluetoothDevice {
+                        name,
+                        addr: raw_addr,
+                        connect_type: Some(ConnectType::SPP),
+                    });
+                }
+            }
+            Ok(out)
+        };
+
+        match session {
+            Some(ScanSession::Spp { abort_handle, .. }) => {
+                abort_handle.abort();
+                stop_spp_and_collect(true)
+            }
+            Some(ScanSession::Ble {
+                cancel_tx,
+                finished_rx,
+                ..
+            }) => {
+                #[cfg(not(target_os = "android"))]
+                let _ =
+                    tauri::async_runtime::block_on(Self::shutdown_ble_scan(cancel_tx, finished_rx));
+                #[cfg(target_os = "android")]
+                let _ = (cancel_tx, finished_rx);
                 Ok(self.scan_results.lock().unwrap().drain(..).collect())
             }
+            None => match self.current_connect_type() {
+                ConnectType::SPP => stop_spp_and_collect(false),
+                ConnectType::BLE => Ok(self.scan_results.lock().unwrap().drain(..).collect()),
+            },
         }
     }
 
     fn connect(&self, addr: String) -> Result<(), ConnectError> {
-        match self.connect_type {
+        match self.current_connect_type() {
             ConnectType::SPP => {
                 let app = Self::app().ok_or(ConnectError::DeviceNotFound)?;
                 let spp = app.btclassic_spp();
-                match spp.connect(&addr, true) {
+                let fallback_channels = self.current_spp_fallback_channels();
+                log::info!(
+                    "StdImp::connect (SPP) addr={} fallback_channels={:?}",
+                    addr,
+                    fallback_channels
+                );
+                match spp.connect_with_fallback_channels(&addr, true, &fallback_channels) {
                     Ok(res) if res.ret => Ok(()),
                     Ok(_) => Err(ConnectError::TargetRejected),
                     Err(_) => Err(ConnectError::DeviceNotFound),
@@ -891,13 +1069,21 @@ impl BluetoothInterface for StdImp {
                     let deadline = Instant::now() + Duration::from_secs(12);
                     while Instant::now() < deadline {
                         if let Some(dev) = scan.next().await {
-                            if dev.device.id().to_string().eq_ignore_ascii_case(&addr) {
+                            let raw_id = dev.device.id().to_string();
+                            let vivo_mac =
+                                Self::parse_vivo_advertisement(&dev.adv_data).map(|info| info.mac);
+                            let matched = raw_id.eq_ignore_ascii_case(&addr)
+                                || vivo_mac
+                                    .as_ref()
+                                    .is_some_and(|mac| mac.eq_ignore_ascii_case(&addr));
+                            if matched {
                                 device_opt = Some(dev.device.clone());
-                                #[cfg(not(target_os = "android"))]
-                                self.ble_scanned_devices
-                                    .lock()
-                                    .unwrap()
-                                    .insert(addr.clone(), dev.device.clone());
+                                let mut cache = self.ble_scanned_devices.lock().unwrap();
+                                cache.insert(raw_id, dev.device.clone());
+                                cache.insert(addr.clone(), dev.device.clone());
+                                if let Some(mac) = vivo_mac {
+                                    cache.insert(mac, dev.device.clone());
+                                }
                                 break;
                             }
                         } else {
@@ -998,7 +1184,7 @@ impl BluetoothInterface for StdImp {
     }
 
     fn set_on_connected_listener(&self, cb: Arc<dyn Fn() + Send + Sync + 'static>) {
-        match self.connect_type {
+        match self.current_connect_type() {
             ConnectType::SPP => {
                 if let Some(app) = Self::app() {
                     let cb2 = cb.clone();
@@ -1015,7 +1201,7 @@ impl BluetoothInterface for StdImp {
     }
 
     fn max_send_len(&self, characteristic: Option<Uuid>) -> Option<usize> {
-        match self.connect_type {
+        match self.current_connect_type() {
             ConnectType::SPP => {
                 let app = Self::app()?;
                 app.btclassic_spp()
@@ -1041,7 +1227,7 @@ impl BluetoothInterface for StdImp {
     }
 
     fn send(&self, data: Vec<u8>, characteristic: Option<Uuid>) -> Result<(), SendError> {
-        match self.connect_type {
+        match self.current_connect_type() {
             ConnectType::SPP => {
                 let app = Self::app().ok_or(SendError::Disconnected)?;
                 app.btclassic_spp()
@@ -1065,7 +1251,7 @@ impl BluetoothInterface for StdImp {
         characteristic: Option<Uuid>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SendError>> + Send + '_>>
     {
-        match self.connect_type {
+        match self.current_connect_type() {
             ConnectType::SPP => Box::pin(async move { self.send(data, characteristic) }),
             #[cfg(not(target_os = "android"))]
             ConnectType::BLE => Box::pin(self.ble_send_impl(data, characteristic)),
@@ -1080,7 +1266,7 @@ impl BluetoothInterface for StdImp {
         characteristic: Option<Uuid>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SendError>> + Send + '_>>
     {
-        match self.connect_type {
+        match self.current_connect_type() {
             ConnectType::SPP => Box::pin(async move {
                 for item in data {
                     self.send(item, characteristic)?;
@@ -1099,7 +1285,7 @@ impl BluetoothInterface for StdImp {
         cb: Arc<dyn Fn(Result<Vec<u8>, String>) + Send + Sync>,
         characteristic: Option<Uuid>,
     ) -> Result<(), SubscribeError> {
-        match self.connect_type {
+        match self.current_connect_type() {
             ConnectType::SPP => {
                 let app = Self::app().ok_or(SubscribeError::Disconnected)?;
                 let spp = app.btclassic_spp();
@@ -1168,7 +1354,7 @@ impl BluetoothInterface for StdImp {
     }
 
     fn disconnect(&self) -> Result<(), DisconnectError> {
-        match self.connect_type {
+        match self.current_connect_type() {
             ConnectType::SPP => {
                 let app = Self::app().ok_or(DisconnectError::DeviceNotFound)?;
                 app.btclassic_spp()
@@ -1204,5 +1390,42 @@ impl BluetoothInterface for StdImp {
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StdImp;
+
+    #[test]
+    fn vivo_manufacturer_data_matches_java_scan_record_layout() {
+        let data = [
+            0x00, 0x03, 0x11, 0x00, 0x34, 0x12, 0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6,
+        ];
+
+        let info = StdImp::parse_vivo_manufacturer_data(&data).unwrap();
+
+        assert_eq!(info.protocol_version, 3);
+        assert_eq!(info.mask, 0x0011);
+        assert_eq!(info.product_id, 0x1234);
+        assert_eq!(info.mac, "A1:B2:C3:D4:E5:F6");
+    }
+
+    #[test]
+    fn vivo_manufacturer_data_rejects_non_vivo_payloads() {
+        assert!(StdImp::parse_vivo_manufacturer_data(&[1, 2, 3]).is_none());
+        assert!(StdImp::parse_vivo_manufacturer_data(&[0; 12]).is_none());
+    }
+
+    #[test]
+    fn vivo_manufacturer_data_accepts_zero_product_id_like_official_app() {
+        let data = [
+            0x00, 0x03, 0x11, 0x00, 0x00, 0x00, 0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6,
+        ];
+
+        let info = StdImp::parse_vivo_manufacturer_data(&data).unwrap();
+
+        assert_eq!(info.product_id, 0);
+        assert_eq!(info.mac, "A1:B2:C3:D4:E5:F6");
     }
 }
