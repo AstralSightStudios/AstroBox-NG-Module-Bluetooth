@@ -1323,6 +1323,11 @@ impl BluetoothInterface for StdImp {
                                         Err(e) => (cb_clone)(Err(e.to_string())),
                                     }
                                 }
+                                log::warn!(
+                                    "StdImp::subscribe (BLE) notify stream ended on {}; treating as disconnected",
+                                    uuid
+                                );
+                                (cb_clone)(Err("BLE notification stream ended".to_string()));
                             }
                             Err(e) => {
                                 log::error!(
