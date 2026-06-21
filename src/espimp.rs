@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::btinterface::BluetoothInterface;
+use crate::btinterface::{BluetoothInterface, Uuid};
 use tauri::ipc::Channel;
 
 // TODO: 实现可能的ESP32单片机支持
@@ -27,14 +27,14 @@ impl BluetoothInterface for Esp32Imp {
         todo!()
     }
 
-    fn send(&self, _data: Vec<u8>, _characteristic: Option<bluest::Uuid>) -> Result<(), crate::btinterface::SendError> {
+    fn send(&self, _data: Vec<u8>, _characteristic: Option<Uuid>) -> Result<(), crate::btinterface::SendError> {
         todo!()
     }
 
     fn subscribe(
         &self,
         _cb: std::sync::Arc<dyn Fn(Result<Vec<u8>, String>) + Send + Sync>,
-        _characteristic: Option<bluest::Uuid>,
+        _characteristic: Option<Uuid>,
     ) -> Result<(), crate::btinterface::SubscribeError> {
         todo!()
     }

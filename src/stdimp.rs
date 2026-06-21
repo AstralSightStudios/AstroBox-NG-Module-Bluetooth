@@ -17,8 +17,6 @@ use bluest::{
     error::ErrorKind as BluestErrorKind,
 };
 
-use bluest::Uuid;
-
 use btclassic_spp::BtclassicSppExt;
 use futures_util::{
     StreamExt,
@@ -29,7 +27,7 @@ use tokio::sync::{Mutex as AsyncMutex, oneshot};
 
 use crate::btinterface::{
     BluetoothDevice, BluetoothInterface, ConnectError, ConnectType, DisconnectError, ScanError,
-    SendError, SubscribeError,
+    SendError, SubscribeError, Uuid,
 };
 
 const BLE_UUID_KEYWORD_XIAOMI_SERVICE: &str = "0050";
@@ -122,6 +120,11 @@ struct VivoAdvertisementInfo {
 #[derive(Debug)]
 enum ScanSession {
     Spp {
+        id: usize,
+        abort_handle: AbortHandle,
+    },
+    #[cfg(target_os = "android")]
+    AndroidBle {
         id: usize,
         abort_handle: AbortHandle,
     },
@@ -640,11 +643,39 @@ impl BluetoothInterface for StdImp {
             ConnectType::SPP => {
                 let app = Self::app().ok_or(ScanError::AdapterNotFound)?;
 
+                if let Some(session) = {
+                    let mut guard = self.scan_state.lock().unwrap();
+                    guard.take()
+                } {
+                    match session {
+                        ScanSession::Spp { id, abort_handle } => {
+                            let mut guard = self.scan_state.lock().unwrap();
+                            *guard = Some(ScanSession::Spp { id, abort_handle });
+                            return Ok(());
+                        }
+                        #[cfg(target_os = "android")]
+                        ScanSession::AndroidBle { abort_handle, .. } => {
+                            abort_handle.abort();
+                            let _ = app.btclassic_spp().stop_ble_scan();
+                        }
+                        ScanSession::Ble {
+                            cancel_tx,
+                            finished_rx,
+                            ..
+                        } => {
+                            #[cfg(not(target_os = "android"))]
+                            let _ = tauri::async_runtime::block_on(Self::shutdown_ble_scan(
+                                cancel_tx,
+                                finished_rx,
+                            ));
+                            #[cfg(target_os = "android")]
+                            let _ = (cancel_tx, finished_rx);
+                        }
+                    }
+                }
+
                 let (abort_reg, session_id) = {
                     let mut guard = self.scan_state.lock().unwrap();
-                    if guard.is_some() {
-                        return Ok(());
-                    }
                     let session_id = self
                         .scan_seq
                         .fetch_add(1, Ordering::Relaxed)
@@ -950,7 +981,85 @@ impl BluetoothInterface for StdImp {
             }),
 
             #[cfg(target_os = "android")]
-            ConnectType::BLE => Err(ScanError::AdapterNotFound),
+            ConnectType::BLE => {
+                let app = Self::app().ok_or(ScanError::AdapterNotFound)?;
+
+                if let Some(session) = {
+                    let mut guard = self.scan_state.lock().unwrap();
+                    guard.take()
+                } {
+                    match session {
+                        ScanSession::Spp { abort_handle, .. } => {
+                            abort_handle.abort();
+                            let _ = app.btclassic_spp().stop_scan();
+                        }
+                        ScanSession::AndroidBle { abort_handle, .. } => {
+                            abort_handle.abort();
+                            let _ = app.btclassic_spp().stop_ble_scan();
+                        }
+                        ScanSession::Ble { .. } => {}
+                    }
+                }
+
+                self.scan_results.lock().unwrap().clear();
+
+                let session_id = self
+                    .scan_seq
+                    .fetch_add(1, Ordering::Relaxed)
+                    .wrapping_add(1);
+                let (abort_handle, abort_reg) = AbortHandle::new_pair();
+                {
+                    let mut guard = self.scan_state.lock().unwrap();
+                    *guard = Some(ScanSession::AndroidBle {
+                        id: session_id,
+                        abort_handle,
+                    });
+                }
+
+                let app_handle = app.clone();
+                let scan_state = Arc::clone(&self.scan_state);
+                let results = Arc::clone(&self.scan_results);
+                tauri::async_runtime::spawn(async move {
+                    let fut = async move {
+                        let mut known_addrs = HashSet::<String>::new();
+                        loop {
+                            if let Ok(res) = app_handle.btclassic_spp().get_ble_scanned_devices() {
+                                for d in res.ret {
+                                    let name = d.name.unwrap_or_default();
+                                    let raw_addr = d.address;
+                                    let key = normalize_addr_for_dedup(&raw_addr);
+                                    if key.is_empty() {
+                                        continue;
+                                    }
+                                    if known_addrs.insert(key) {
+                                        let item = BluetoothDevice {
+                                            name,
+                                            addr: raw_addr,
+                                            connect_type: Some(ConnectType::BLE),
+                                        };
+                                        results.lock().unwrap().push(item.clone());
+                                        let _ = channel.send(item);
+                                    }
+                                }
+                            }
+                            tokio::time::sleep(Duration::from_millis(400)).await;
+                        }
+                    };
+                    let _ = Abortable::new(fut, abort_reg).await;
+                    let mut guard = scan_state.lock().unwrap();
+                    if matches!(
+                        guard.as_ref(),
+                        Some(ScanSession::AndroidBle { id, .. }) if *id == session_id
+                    ) {
+                        guard.take();
+                    }
+                });
+
+                app.btclassic_spp()
+                    .start_ble_scan()
+                    .map_err(|_| ScanError::AdapterNotFound)?;
+                Ok(())
+            }
         }
     }
 
@@ -992,10 +1101,51 @@ impl BluetoothInterface for StdImp {
             Ok(out)
         };
 
+        #[cfg(target_os = "android")]
+        let stop_android_ble_and_collect =
+            |was_scanning: bool| -> Result<Vec<BluetoothDevice>, ScanError> {
+                let app = Self::app().ok_or(ScanError::AdapterNotFound)?;
+                let spp = app.btclassic_spp();
+
+                if was_scanning {
+                    let _ = spp
+                        .stop_ble_scan()
+                        .map_err(|_| ScanError::AdapterNotFound)?;
+                }
+
+                let result = spp
+                    .get_ble_scanned_devices()
+                    .map_err(|_| ScanError::AdapterNotFound)?;
+
+                let mut seen = HashSet::<String>::new();
+                let mut out = Vec::new();
+                for d in result.ret {
+                    let name = d.name.unwrap_or_default();
+                    let raw_addr = d.address;
+                    let key = normalize_addr_for_dedup(&raw_addr);
+                    if key.is_empty() {
+                        continue;
+                    }
+                    if seen.insert(key) {
+                        out.push(BluetoothDevice {
+                            name,
+                            addr: raw_addr,
+                            connect_type: Some(ConnectType::BLE),
+                        });
+                    }
+                }
+                Ok(out)
+            };
+
         match session {
             Some(ScanSession::Spp { abort_handle, .. }) => {
                 abort_handle.abort();
                 stop_spp_and_collect(true)
+            }
+            #[cfg(target_os = "android")]
+            Some(ScanSession::AndroidBle { abort_handle, .. }) => {
+                abort_handle.abort();
+                stop_android_ble_and_collect(true)
             }
             Some(ScanSession::Ble {
                 cancel_tx,
@@ -1011,6 +1161,9 @@ impl BluetoothInterface for StdImp {
             }
             None => match self.current_connect_type() {
                 ConnectType::SPP => stop_spp_and_collect(false),
+                #[cfg(target_os = "android")]
+                ConnectType::BLE => stop_android_ble_and_collect(false),
+                #[cfg(not(target_os = "android"))]
                 ConnectType::BLE => Ok(self.scan_results.lock().unwrap().drain(..).collect()),
             },
         }
@@ -1179,7 +1332,29 @@ impl BluetoothInterface for StdImp {
             }),
 
             #[cfg(target_os = "android")]
-            ConnectType::BLE => Err(ConnectError::DeviceNotFound),
+            ConnectType::BLE => {
+                let app = Self::app().ok_or(ConnectError::DeviceNotFound)?;
+                let spp = app.btclassic_spp();
+                log::info!("StdImp::connect (BLE, android) addr={}", addr);
+                match spp.connect_ble(&addr) {
+                    Ok(res) if res.ret => {
+                        let cb_opt = self.ble_on_connected.lock().unwrap().clone();
+                        if let Some(cb) = cb_opt {
+                            cb();
+                        } else {
+                            log::warn!(
+                                "StdImp::connect (BLE, android) no on_connected callback registered; upper layers may hang"
+                            );
+                        }
+                        Ok(())
+                    }
+                    Ok(_) => Err(ConnectError::TargetRejected),
+                    Err(err) => {
+                        log::warn!("StdImp::connect (BLE, android) failed: {}", err);
+                        Err(ConnectError::DeviceNotFound)
+                    }
+                }
+            }
         }
     }
 
@@ -1222,7 +1397,14 @@ impl BluetoothInterface for StdImp {
             }
 
             #[cfg(target_os = "android")]
-            ConnectType::BLE => None,
+            ConnectType::BLE => {
+                let app = Self::app()?;
+                app.btclassic_spp()
+                    .get_ble_max_send_len()
+                    .ok()
+                    .flatten()
+                    .filter(|len| *len > 0)
+            }
         }
     }
 
@@ -1241,7 +1423,12 @@ impl BluetoothInterface for StdImp {
             }
 
             #[cfg(target_os = "android")]
-            ConnectType::BLE => Err(SendError::Disconnected),
+            ConnectType::BLE => {
+                let app = Self::app().ok_or(SendError::Disconnected)?;
+                app.btclassic_spp()
+                    .send_ble(&data)
+                    .map_err(|_| SendError::Disconnected)
+            }
         }
     }
 
@@ -1256,7 +1443,10 @@ impl BluetoothInterface for StdImp {
             #[cfg(not(target_os = "android"))]
             ConnectType::BLE => Box::pin(self.ble_send_impl(data, characteristic)),
             #[cfg(target_os = "android")]
-            ConnectType::BLE => Box::pin(async { Err(SendError::Disconnected) }),
+            ConnectType::BLE => Box::pin(async move {
+                let _ = characteristic;
+                self.send(data, None)
+            }),
         }
     }
 
@@ -1276,7 +1466,13 @@ impl BluetoothInterface for StdImp {
             #[cfg(not(target_os = "android"))]
             ConnectType::BLE => Box::pin(self.ble_send_many_impl(data, characteristic)),
             #[cfg(target_os = "android")]
-            ConnectType::BLE => Box::pin(async { Err(SendError::Disconnected) }),
+            ConnectType::BLE => Box::pin(async move {
+                let _ = characteristic;
+                for item in data {
+                    self.send(item, None)?;
+                }
+                Ok(())
+            }),
         }
     }
 
@@ -1354,7 +1550,16 @@ impl BluetoothInterface for StdImp {
             }
 
             #[cfg(target_os = "android")]
-            ConnectType::BLE => Err(SubscribeError::Disconnected),
+            ConnectType::BLE => {
+                let _ = characteristic;
+                let app = Self::app().ok_or(SubscribeError::Disconnected)?;
+                let spp = app.btclassic_spp();
+                let cb_clone = cb.clone();
+                spp.set_data_listener(move |res| (cb_clone)(res))
+                    .map_err(|_| SubscribeError::Disconnected)?;
+                spp.start_ble_subscription()
+                    .map_err(|_| SubscribeError::Disconnected)
+            }
         }
     }
 
@@ -1392,7 +1597,10 @@ impl BluetoothInterface for StdImp {
             #[cfg(target_os = "android")]
             ConnectType::BLE => {
                 self.ble_clear_cache();
-                Ok(())
+                let app = Self::app().ok_or(DisconnectError::DeviceNotFound)?;
+                app.btclassic_spp()
+                    .disconnect_ble()
+                    .map_err(|_| DisconnectError::DeviceNotFound)
             }
         }
     }

@@ -1,4 +1,3 @@
-use bluest::Uuid;
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Debug, Display};
 use std::future::Future;
@@ -24,6 +23,8 @@ macro_rules! impl_error {
 // Android 下不引入 bluest，提供桩类型
 #[cfg(target_os = "android")]
 pub mod ble_stub {
+    use std::fmt;
+
     #[derive(Debug, Clone)]
     pub struct Adapter;
     #[derive(Debug, Clone)]
@@ -34,7 +35,39 @@ pub mod ble_stub {
     pub struct BluestService;
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct Uuid([u8; 16]);
+
+    impl fmt::Display for Uuid {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let b = self.0;
+            write!(
+                f,
+                "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                b[0],
+                b[1],
+                b[2],
+                b[3],
+                b[4],
+                b[5],
+                b[6],
+                b[7],
+                b[8],
+                b[9],
+                b[10],
+                b[11],
+                b[12],
+                b[13],
+                b[14],
+                b[15]
+            )
+        }
+    }
 }
+
+#[cfg(target_os = "android")]
+pub use ble_stub::Uuid;
+
+#[cfg(not(target_os = "android"))]
+pub use bluest::Uuid;
 
 #[derive(Debug)]
 pub enum ScanError {
