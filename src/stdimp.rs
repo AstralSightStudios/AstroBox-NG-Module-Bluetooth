@@ -8,22 +8,19 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(target_os = "android")]
-use crate::btinterface::ble_stub::{Adapter, BluestDevice, BluestService, Characteristic};
-
 #[cfg(not(target_os = "android"))]
 use bluest::{
-    Adapter, AdvertisementData, Characteristic, Device as BluestDevice, Service as BluestService,
-    error::ErrorKind as BluestErrorKind,
+    error::ErrorKind as BluestErrorKind, Adapter, AdvertisementData, Characteristic,
+    Device as BluestDevice, Service as BluestService,
 };
 
 use btclassic_spp::BtclassicSppExt;
 use futures_util::{
-    StreamExt,
     future::{AbortHandle, Abortable},
+    StreamExt,
 };
 use tauri::{AppHandle, Wry};
-use tokio::sync::{Mutex as AsyncMutex, oneshot};
+use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
 use crate::btinterface::{
     BluetoothDevice, BluetoothInterface, ConnectError, ConnectType, DisconnectError, ScanError,
@@ -78,17 +75,18 @@ pub fn normalize_addr_for_dedup(raw: &str) -> String {
 }
 
 pub struct StdImp {
-    connect_type: Mutex<ConnectType>,
-    spp_fallback_channels: Mutex<Vec<u8>>,
+    // Kept for scan selection; connection operations are address-scoped.
+    scan_connect_type: ConnectType,
 
-    ble_device: Mutex<Option<BluestDevice>>,
-    ble_services: Mutex<Option<Vec<BluestService>>>,
-    ble_chara_cache: Mutex<HashMap<Uuid, Characteristic>>,
-    ble_char_bundle: Mutex<Option<BleCharacteristicBundle>>,
-    ble_send_lock: AsyncMutex<()>,
+    // The transport for subsequent address-scoped operations is recorded when
+    // connect is called. Fallback channels are supplied to connect directly.
+    addressed_connect_types: Mutex<HashMap<String, ConnectType>>,
+    #[cfg(not(target_os = "android"))]
+    addressed_on_connected: Mutex<HashMap<String, Arc<dyn Fn() + Send + Sync + 'static>>>,
+    #[cfg(not(target_os = "android"))]
+    addressed_ble_sessions: Mutex<HashMap<String, Arc<AddressedBleSession>>>,
     #[cfg(not(target_os = "android"))]
     ble_scanned_devices: Arc<Mutex<HashMap<String, BluestDevice>>>,
-    ble_on_connected: Mutex<Option<Arc<dyn Fn() + Send + Sync + 'static>>>,
     scan_state: Arc<Mutex<Option<ScanSession>>>,
     scan_seq: AtomicUsize,
     scan_results: Arc<Mutex<Vec<BluetoothDevice>>>,
@@ -97,16 +95,25 @@ pub struct StdImp {
 impl fmt::Debug for StdImp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StdImp")
-            .field("connect_type", &self.current_connect_type())
+            .field("scan_connect_type", &self.scan_connect_type)
             .finish()
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct BleCharacteristicBundle {
     service: Option<Uuid>,
     recv: Option<Uuid>,
     sent: Option<Uuid>,
+}
+
+#[cfg(not(target_os = "android"))]
+struct AddressedBleSession {
+    device: BluestDevice,
+    services: Vec<BluestService>,
+    chara_cache: Arc<Mutex<HashMap<Uuid, Characteristic>>>,
+    char_bundle: BleCharacteristicBundle,
+    send_lock: Arc<AsyncMutex<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -138,16 +145,14 @@ enum ScanSession {
 impl StdImp {
     pub fn new(connect_type: ConnectType) -> Self {
         Self {
-            connect_type: Mutex::new(connect_type),
-            spp_fallback_channels: Mutex::new(vec![5, 1]),
-            ble_device: Mutex::new(None),
-            ble_services: Mutex::new(None),
-            ble_chara_cache: Mutex::new(HashMap::new()),
-            ble_char_bundle: Mutex::new(None),
-            ble_send_lock: AsyncMutex::new(()),
+            scan_connect_type: connect_type,
+            addressed_connect_types: Mutex::new(HashMap::new()),
+            #[cfg(not(target_os = "android"))]
+            addressed_on_connected: Mutex::new(HashMap::new()),
+            #[cfg(not(target_os = "android"))]
+            addressed_ble_sessions: Mutex::new(HashMap::new()),
             #[cfg(not(target_os = "android"))]
             ble_scanned_devices: Arc::new(Mutex::new(HashMap::new())),
-            ble_on_connected: Mutex::new(None),
             scan_state: Arc::new(Mutex::new(None)),
             scan_seq: AtomicUsize::new(0),
             scan_results: Arc::new(Mutex::new(Vec::new())),
@@ -157,58 +162,6 @@ impl StdImp {
     #[inline]
     fn app() -> Option<&'static AppHandle<Wry>> {
         APP_HANDLE.get()
-    }
-
-    fn current_connect_type(&self) -> ConnectType {
-        *self.connect_type.lock().unwrap()
-    }
-
-    fn normalize_spp_fallback_channels(channels: Vec<u8>) -> Vec<u8> {
-        let source = if channels.is_empty() {
-            vec![5, 1]
-        } else {
-            channels
-        };
-
-        let mut out = Vec::new();
-        for channel in source {
-            if channel != 0 && !out.contains(&channel) {
-                out.push(channel);
-            }
-        }
-        if out.is_empty() {
-            out.extend([5, 1]);
-        }
-        out
-    }
-
-    fn current_spp_fallback_channels(&self) -> Vec<u8> {
-        self.spp_fallback_channels.lock().unwrap().clone()
-    }
-
-    fn update_connect_type(&self, connect_type: ConnectType) {
-        let mut guard = self.connect_type.lock().unwrap();
-        if *guard != connect_type {
-            log::info!(
-                "StdImp::set_connect_type switching transport {:?} -> {:?}",
-                *guard,
-                connect_type
-            );
-            *guard = connect_type;
-        }
-    }
-
-    fn update_spp_fallback_channels(&self, channels: Vec<u8>) {
-        let channels = Self::normalize_spp_fallback_channels(channels);
-        let mut guard = self.spp_fallback_channels.lock().unwrap();
-        if *guard != channels {
-            log::info!(
-                "StdImp::set_spp_fallback_channels switching {:?} -> {:?}",
-                *guard,
-                channels
-            );
-            *guard = channels;
-        }
     }
 
     #[cfg(not(target_os = "android"))]
@@ -334,191 +287,6 @@ impl StdImp {
         out
     }
 
-    fn ble_default_recv_uuid(&self) -> Option<Uuid> {
-        self.ble_char_bundle
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|bundle| bundle.recv)
-    }
-
-    fn ble_default_sent_uuid(&self) -> Option<Uuid> {
-        self.ble_char_bundle
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|bundle| bundle.sent)
-    }
-
-    fn ble_default_service_uuid(&self) -> Option<Uuid> {
-        self.ble_char_bundle
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|bundle| bundle.service)
-    }
-
-    #[cfg(not(target_os = "android"))]
-    async fn ble_get_or_discover_chara(
-        &self,
-        uuid: Uuid,
-    ) -> Result<Characteristic, SubscribeError> {
-        if let Some(ch) = self.ble_chara_cache.lock().unwrap().get(&uuid).cloned() {
-            return Ok(ch);
-        }
-
-        let services = self
-            .ble_services
-            .lock()
-            .unwrap()
-            .as_ref()
-            .cloned()
-            .ok_or(SubscribeError::Disconnected)?;
-
-        for svc in services {
-            let chars = svc
-                .discover_characteristics()
-                .await
-                .map_err(|_| SubscribeError::Disconnected)?;
-            for c in chars {
-                if c.uuid() == uuid {
-                    self.ble_chara_cache.lock().unwrap().insert(uuid, c.clone());
-                    return Ok(c);
-                }
-            }
-        }
-        Err(SubscribeError::BleCharaNotFound)
-    }
-
-    #[cfg(target_os = "android")]
-    async fn ble_get_or_discover_chara(
-        &self,
-        _uuid: Uuid,
-    ) -> Result<Characteristic, SubscribeError> {
-        Err(SubscribeError::BleCharaNotFound)
-    }
-
-    #[cfg(not(target_os = "android"))]
-    async fn ble_extract_default_characteristics(
-        &self,
-        services: &[BluestService],
-    ) -> Result<(), ConnectError> {
-        let mut bundle = BleCharacteristicBundle::default();
-
-        for svc in services {
-            let svc_uuid = svc.uuid();
-            let is_xiaomi = Self::uuid_contains(&svc_uuid, "fe95");
-            let is_vivo = Self::uuid_compact_eq(&svc_uuid, BLE_UUID_VIVO_SERVICE);
-            if !is_xiaomi && !is_vivo {
-                continue;
-            }
-
-            let chars = svc
-                .discover_characteristics()
-                .await
-                .map_err(|_| ConnectError::TargetRejected)?;
-
-            for c in chars {
-                let cuuid = c.uuid();
-                if is_xiaomi && Self::uuid_contains(&cuuid, BLE_UUID_KEYWORD_XIAOMI_RECV) {
-                    log::debug!(
-                        "StdImp::ble_extract_default_characteristics detected Xiaomi recv characteristic {}",
-                        cuuid
-                    );
-                    bundle.recv = Some(cuuid);
-                } else if is_xiaomi && Self::uuid_contains(&cuuid, BLE_UUID_KEYWORD_XIAOMI_SENT) {
-                    log::debug!(
-                        "StdImp::ble_extract_default_characteristics detected Xiaomi sent characteristic {}",
-                        cuuid
-                    );
-                    bundle.sent = Some(cuuid);
-                } else if is_xiaomi && Self::uuid_contains(&cuuid, BLE_UUID_KEYWORD_XIAOMI_SERVICE)
-                {
-                    log::debug!(
-                        "StdImp::ble_extract_default_characteristics detected Xiaomi service characteristic {}",
-                        cuuid
-                    );
-                    bundle.service = Some(cuuid);
-                } else if is_vivo && Self::uuid_compact_eq(&cuuid, BLE_UUID_VIVO_RECV) {
-                    log::debug!(
-                        "StdImp::ble_extract_default_characteristics detected vivo notify characteristic {}",
-                        cuuid
-                    );
-                    bundle.recv = Some(cuuid);
-                } else if is_vivo && Self::uuid_compact_eq(&cuuid, BLE_UUID_VIVO_SENT) {
-                    log::debug!(
-                        "StdImp::ble_extract_default_characteristics detected vivo write characteristic {}",
-                        cuuid
-                    );
-                    bundle.sent = Some(cuuid);
-                }
-                self.ble_chara_cache
-                    .lock()
-                    .unwrap()
-                    .insert(cuuid, c.clone());
-            }
-        }
-
-        if bundle.recv.is_none() || bundle.sent.is_none() {
-            return Err(ConnectError::TargetRejected);
-        }
-
-        *self.ble_char_bundle.lock().unwrap() = Some(bundle);
-        Ok(())
-    }
-
-    fn ble_clear_cache(&self) {
-        *self.ble_device.lock().unwrap() = None;
-        *self.ble_services.lock().unwrap() = None;
-        self.ble_chara_cache.lock().unwrap().clear();
-        *self.ble_char_bundle.lock().unwrap() = None;
-    }
-
-    #[cfg(not(target_os = "android"))]
-    async fn ble_send_impl(
-        &self,
-        data: Vec<u8>,
-        characteristic: Option<Uuid>,
-    ) -> Result<(), SendError> {
-        self.ble_send_many_impl(vec![data], characteristic).await
-    }
-
-    #[cfg(not(target_os = "android"))]
-    async fn ble_send_many_impl(
-        &self,
-        data: Vec<Vec<u8>>,
-        characteristic: Option<Uuid>,
-    ) -> Result<(), SendError> {
-        let _send_guard = self.ble_send_lock.lock().await;
-        let uuid = match characteristic {
-            Some(uuid) => uuid,
-            None => self
-                .ble_default_sent_uuid()
-                .ok_or(SendError::BleCharaNotFound)?,
-        };
-
-        if self.ble_device.lock().unwrap().is_none() {
-            return Err(SendError::Disconnected);
-        }
-
-        let chara = self
-            .ble_get_or_discover_chara(uuid)
-            .await
-            .map_err(|e| match e {
-                SubscribeError::BleCharaNotFound => SendError::BleCharaNotFound,
-                _ => SendError::Disconnected,
-            })?;
-
-        for item in data {
-            chara
-                .write_without_response(&item)
-                .await
-                .map_err(|_| SendError::Disconnected)?;
-        }
-
-        Ok(())
-    }
-
     #[cfg(target_os = "ios")]
     async fn ble_probe_connected_device_by_addr(
         &self,
@@ -617,25 +385,346 @@ impl StdImp {
     }
 }
 
+impl StdImp {
+    fn addressed_key(addr: &str) -> String {
+        addr.trim().to_string()
+    }
+
+    fn addressed_connect_type(&self, addr: &str) -> Option<ConnectType> {
+        self.addressed_connect_types
+            .lock()
+            .unwrap()
+            .get(&Self::addressed_key(addr))
+            .copied()
+    }
+
+    #[cfg(not(target_os = "android"))]
+    async fn build_addressed_ble_session(
+        device: BluestDevice,
+        services: Vec<BluestService>,
+    ) -> Result<Arc<AddressedBleSession>, ConnectError> {
+        let mut bundle = BleCharacteristicBundle::default();
+        let mut chara_cache = HashMap::new();
+
+        for service in &services {
+            let service_uuid = service.uuid();
+            let is_xiaomi = Self::uuid_contains(&service_uuid, "fe95");
+            let is_vivo = Self::uuid_compact_eq(&service_uuid, BLE_UUID_VIVO_SERVICE);
+            if !is_xiaomi && !is_vivo {
+                continue;
+            }
+
+            let chars = service
+                .discover_characteristics()
+                .await
+                .map_err(|_| ConnectError::TargetRejected)?;
+            for characteristic in chars {
+                let uuid = characteristic.uuid();
+                if is_xiaomi && Self::uuid_contains(&uuid, BLE_UUID_KEYWORD_XIAOMI_RECV) {
+                    bundle.recv = Some(uuid);
+                } else if is_xiaomi && Self::uuid_contains(&uuid, BLE_UUID_KEYWORD_XIAOMI_SENT) {
+                    bundle.sent = Some(uuid);
+                } else if is_xiaomi && Self::uuid_contains(&uuid, BLE_UUID_KEYWORD_XIAOMI_SERVICE) {
+                    bundle.service = Some(uuid);
+                } else if is_vivo && Self::uuid_compact_eq(&uuid, BLE_UUID_VIVO_RECV) {
+                    bundle.recv = Some(uuid);
+                } else if is_vivo && Self::uuid_compact_eq(&uuid, BLE_UUID_VIVO_SENT) {
+                    bundle.sent = Some(uuid);
+                }
+                chara_cache.insert(uuid, characteristic);
+            }
+        }
+
+        if bundle.recv.is_none() || bundle.sent.is_none() {
+            return Err(ConnectError::TargetRejected);
+        }
+
+        Ok(Arc::new(AddressedBleSession {
+            device,
+            services,
+            chara_cache: Arc::new(Mutex::new(chara_cache)),
+            char_bundle: bundle,
+            send_lock: Arc::new(AsyncMutex::new(())),
+        }))
+    }
+
+    #[cfg(not(target_os = "android"))]
+    async fn addressed_ble_get_or_discover_chara(
+        session: &AddressedBleSession,
+        uuid: Uuid,
+    ) -> Result<Characteristic, SubscribeError> {
+        if let Some(chara) = session.chara_cache.lock().unwrap().get(&uuid).cloned() {
+            return Ok(chara);
+        }
+
+        for service in &session.services {
+            let chars = service
+                .discover_characteristics()
+                .await
+                .map_err(|_| SubscribeError::Disconnected)?;
+            for chara in chars {
+                if chara.uuid() == uuid {
+                    session
+                        .chara_cache
+                        .lock()
+                        .unwrap()
+                        .insert(uuid, chara.clone());
+                    return Ok(chara);
+                }
+            }
+        }
+        Err(SubscribeError::BleCharaNotFound)
+    }
+
+    #[cfg(not(target_os = "android"))]
+    async fn connect_addressed_ble(&self, addr: String) -> Result<(), ConnectError> {
+        let key = Self::addressed_key(&addr);
+        let adapter = Self::ble_adapter().await?;
+
+        if let Some(old_session) = self.addressed_ble_sessions.lock().unwrap().remove(&key) {
+            let _ = adapter.disconnect_device(&old_session.device).await;
+        }
+
+        let mut device_opt = self.ble_scanned_devices.lock().unwrap().get(&addr).cloned();
+
+        #[cfg(target_os = "ios")]
+        if device_opt.is_none() {
+            device_opt = self
+                .ble_probe_connected_device_by_addr(adapter, &addr)
+                .await;
+            if let Some(device) = &device_opt {
+                self.ble_scanned_devices
+                    .lock()
+                    .unwrap()
+                    .insert(addr.clone(), device.clone());
+            }
+        }
+
+        if device_opt.is_none() {
+            let mut scan = adapter
+                .scan(&[])
+                .await
+                .map_err(|_| ConnectError::DeviceNotFound)?;
+            let deadline = Instant::now() + Duration::from_secs(12);
+            while Instant::now() < deadline {
+                if let Some(item) = scan.next().await {
+                    let raw_id = item.device.id().to_string();
+                    let vivo_mac =
+                        Self::parse_vivo_advertisement(&item.adv_data).map(|info| info.mac);
+                    if raw_id.eq_ignore_ascii_case(&addr)
+                        || vivo_mac
+                            .as_ref()
+                            .is_some_and(|mac| mac.eq_ignore_ascii_case(&addr))
+                    {
+                        let device = item.device.clone();
+                        let mut cache = self.ble_scanned_devices.lock().unwrap();
+                        cache.insert(raw_id, device.clone());
+                        cache.insert(addr.clone(), device.clone());
+                        if let Some(mac) = vivo_mac {
+                            cache.insert(mac, device.clone());
+                        }
+                        device_opt = Some(device);
+                        break;
+                    }
+                } else {
+                    tokio::time::sleep(Duration::from_millis(60)).await;
+                }
+            }
+        }
+
+        let device = device_opt.ok_or(ConnectError::DeviceNotFound)?;
+        #[cfg(target_os = "ios")]
+        let already_connected = device.is_connected().await;
+        #[cfg(not(target_os = "ios"))]
+        let already_connected = false;
+
+        if !already_connected {
+            adapter
+                .connect_device(&device)
+                .await
+                .map_err(|_| ConnectError::TargetRejected)?;
+        }
+
+        let mut attempts = 0;
+        while !device.is_connected().await {
+            if attempts >= 20 {
+                break;
+            }
+            attempts += 1;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if !device.is_connected().await {
+            return Err(ConnectError::TargetRejected);
+        }
+
+        if let Err(err) = device.pair().await {
+            log::warn!("BLE pair failed for {}: {}", addr, err);
+        }
+        let services = device
+            .discover_services()
+            .await
+            .map_err(|_| ConnectError::TargetRejected)?;
+        let session = Self::build_addressed_ble_session(device, services).await?;
+        self.addressed_ble_sessions
+            .lock()
+            .unwrap()
+            .insert(key.clone(), session);
+
+        if let Some(cb) = self
+            .addressed_on_connected
+            .lock()
+            .unwrap()
+            .get(&key)
+            .cloned()
+        {
+            cb();
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "android"))]
+    async fn addressed_ble_send_many(
+        &self,
+        addr: String,
+        data: Vec<Vec<u8>>,
+        characteristic: Option<Uuid>,
+    ) -> Result<(), SendError> {
+        let key = Self::addressed_key(&addr);
+        let session = self
+            .addressed_ble_sessions
+            .lock()
+            .unwrap()
+            .get(&key)
+            .cloned()
+            .ok_or(SendError::Disconnected)?;
+        let _send_guard = session.send_lock.lock().await;
+        let uuid = characteristic
+            .or(session.char_bundle.sent)
+            .ok_or(SendError::BleCharaNotFound)?;
+        if !session.device.is_connected().await {
+            return Err(SendError::Disconnected);
+        }
+        let chara = Self::addressed_ble_get_or_discover_chara(&session, uuid)
+            .await
+            .map_err(|err| match err {
+                SubscribeError::BleCharaNotFound => SendError::BleCharaNotFound,
+                SubscribeError::Disconnected => SendError::Disconnected,
+            })?;
+        for item in data {
+            chara
+                .write_without_response(&item)
+                .await
+                .map_err(|_| SendError::Disconnected)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn addressed_ble_max_send_len(
+        &self,
+        addr: &str,
+        characteristic: Option<Uuid>,
+    ) -> Option<usize> {
+        let key = Self::addressed_key(addr);
+        let session = self
+            .addressed_ble_sessions
+            .lock()
+            .unwrap()
+            .get(&key)
+            .cloned()?;
+        let uuid = characteristic.or(session.char_bundle.sent)?;
+        tauri::async_runtime::block_on(async {
+            Self::addressed_ble_get_or_discover_chara(&session, uuid)
+                .await
+                .ok()?
+                .max_write_len_async()
+                .await
+                .ok()
+        })
+        .filter(|len| *len > 0)
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn addressed_ble_subscribe(
+        &self,
+        addr: &str,
+        cb: Arc<dyn Fn(Result<Vec<u8>, String>) + Send + Sync>,
+        characteristic: Option<Uuid>,
+    ) -> Result<(), SubscribeError> {
+        let key = Self::addressed_key(addr);
+        let session = self
+            .addressed_ble_sessions
+            .lock()
+            .unwrap()
+            .get(&key)
+            .cloned()
+            .ok_or(SubscribeError::Disconnected)?;
+        let uuid = characteristic
+            .or(session.char_bundle.recv)
+            .ok_or(SubscribeError::BleCharaNotFound)?;
+        tauri::async_runtime::block_on(async move {
+            if !session.device.is_connected().await {
+                return Err(SubscribeError::Disconnected);
+            }
+            let chara = Self::addressed_ble_get_or_discover_chara(&session, uuid).await?;
+            tauri::async_runtime::spawn(async move {
+                match chara.notify().await {
+                    Ok(mut notify) => {
+                        while let Some(item) = notify.next().await {
+                            match item {
+                                Ok(bytes) => cb(Ok(bytes)),
+                                Err(err) => cb(Err(err.to_string())),
+                            }
+                        }
+                        cb(Err("BLE notification stream ended".to_string()));
+                    }
+                    Err(err) => cb(Err(err.to_string())),
+                }
+            });
+            if let Some(service_uuid) = session.char_bundle.service {
+                if let Ok(service_chara) =
+                    Self::addressed_ble_get_or_discover_chara(&session, service_uuid).await
+                {
+                    if let Err(err) = service_chara.read().await {
+                        log::debug!("Failed to read Xiaomi service characteristic: {}", err);
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn disconnect_addressed_ble(&self, addr: &str) -> Result<(), DisconnectError> {
+        let key = Self::addressed_key(addr);
+        let session = self.addressed_ble_sessions.lock().unwrap().remove(&key);
+        self.addressed_on_connected.lock().unwrap().remove(&key);
+        let Some(session) = session else {
+            return Ok(());
+        };
+        tauri::async_runtime::block_on(async {
+            let adapter = Self::ble_adapter()
+                .await
+                .map_err(|_| DisconnectError::DeviceNotFound)?;
+            adapter
+                .disconnect_device(&session.device)
+                .await
+                .map_err(|_| DisconnectError::DeviceNotFound)
+        })
+    }
+}
+
 impl BluetoothInterface for StdImp {
-    fn set_connect_type(&self, connect_type: ConnectType) {
-        self.update_connect_type(connect_type);
-    }
-
-    fn set_spp_fallback_channels(&self, channels: Vec<u8>) {
-        self.update_spp_fallback_channels(channels);
-    }
-
     fn start_scan(
         &self,
         channel: tauri::ipc::Channel<BluetoothDevice>,
         connect_type: Option<ConnectType>,
     ) -> Result<(), ScanError> {
-        let scan_connect_type = connect_type.unwrap_or_else(|| self.current_connect_type());
+        let scan_connect_type = connect_type.unwrap_or(self.scan_connect_type);
         log::info!(
-            "StdImp::start_scan invoked for {:?}; active transport={:?}; current scan_state active={} (linux={})",
+            "StdImp::start_scan invoked for {:?}; default transport={:?}; current scan_state active={} (linux={})",
             scan_connect_type,
-            self.current_connect_type(),
+            self.scan_connect_type,
             self.scan_state.lock().unwrap().is_some(),
             cfg!(target_os = "linux")
         );
@@ -1159,7 +1248,7 @@ impl BluetoothInterface for StdImp {
                 let _ = (cancel_tx, finished_rx);
                 Ok(self.scan_results.lock().unwrap().drain(..).collect())
             }
-            None => match self.current_connect_type() {
+            None => match self.scan_connect_type {
                 ConnectType::SPP => stop_spp_and_collect(false),
                 #[cfg(target_os = "android")]
                 ConnectType::BLE => stop_android_ble_and_collect(false),
@@ -1169,440 +1258,257 @@ impl BluetoothInterface for StdImp {
         }
     }
 
-    fn connect(&self, addr: String) -> Result<(), ConnectError> {
-        match self.current_connect_type() {
+    fn connect(
+        &self,
+        addr: String,
+        connect_type: ConnectType,
+        spp_fallback_channels: Vec<u8>,
+    ) -> Result<(), ConnectError> {
+        let key = Self::addressed_key(&addr);
+        self.addressed_connect_types
+            .lock()
+            .unwrap()
+            .insert(key, connect_type);
+        let fallback_channels = if spp_fallback_channels.is_empty() {
+            vec![5, 1]
+        } else {
+            spp_fallback_channels
+                .into_iter()
+                .filter(|channel| *channel != 0)
+                .collect()
+        };
+        let fallback_channels = if fallback_channels.is_empty() {
+            vec![5, 1]
+        } else {
+            fallback_channels
+        };
+
+        match connect_type {
             ConnectType::SPP => {
                 let app = Self::app().ok_or(ConnectError::DeviceNotFound)?;
-                let spp = app.btclassic_spp();
-                let fallback_channels = self.current_spp_fallback_channels();
-                log::info!(
-                    "StdImp::connect (SPP) addr={} fallback_channels={:?}",
-                    addr,
-                    fallback_channels
-                );
-                match spp.connect_with_fallback_channels(&addr, true, &fallback_channels) {
-                    Ok(res) if res.ret => Ok(()),
-                    Ok(_) => Err(ConnectError::TargetRejected),
-                    Err(_) => Err(ConnectError::DeviceNotFound),
-                }
-            }
-
-            #[cfg(not(target_os = "android"))]
-            ConnectType::BLE => tauri::async_runtime::block_on(async {
-                log::info!("StdImp::connect (BLE) starting for addr={}", addr);
-                let adapter = Self::ble_adapter().await?;
-
-                let mut device_opt = {
-                    let map = self.ble_scanned_devices.lock().unwrap();
-                    map.get(&addr).cloned()
-                };
-
-                #[cfg(target_os = "ios")]
-                if device_opt.is_none() {
-                    device_opt = self
-                        .ble_probe_connected_device_by_addr(adapter, &addr)
-                        .await;
-                    if let Some(dev) = &device_opt {
-                        self.ble_scanned_devices
-                            .lock()
-                            .unwrap()
-                            .insert(addr.clone(), dev.clone());
-                    }
-                }
-
-                if device_opt.is_none() {
-                    log::debug!(
-                        "StdImp::connect (BLE) cache miss for addr={}, starting on-demand scan",
-                        addr
-                    );
-                    let mut scan = adapter
-                        .scan(&[])
-                        .await
-                        .map_err(|_| ConnectError::DeviceNotFound)?;
-                    let deadline = Instant::now() + Duration::from_secs(12);
-                    while Instant::now() < deadline {
-                        if let Some(dev) = scan.next().await {
-                            let raw_id = dev.device.id().to_string();
-                            let vivo_mac =
-                                Self::parse_vivo_advertisement(&dev.adv_data).map(|info| info.mac);
-                            let matched = raw_id.eq_ignore_ascii_case(&addr)
-                                || vivo_mac
-                                    .as_ref()
-                                    .is_some_and(|mac| mac.eq_ignore_ascii_case(&addr));
-                            if matched {
-                                device_opt = Some(dev.device.clone());
-                                let mut cache = self.ble_scanned_devices.lock().unwrap();
-                                cache.insert(raw_id, dev.device.clone());
-                                cache.insert(addr.clone(), dev.device.clone());
-                                if let Some(mac) = vivo_mac {
-                                    cache.insert(mac, dev.device.clone());
-                                }
-                                break;
-                            }
+                app.btclassic_spp()
+                    .connect(&addr, true, &fallback_channels)
+                    .map_err(|_| ConnectError::DeviceNotFound)
+                    .and_then(|result| {
+                        if result.ret {
+                            Ok(())
                         } else {
-                            tokio::time::sleep(Duration::from_millis(60)).await;
+                            Err(ConnectError::TargetRejected)
                         }
-                    }
-                }
-
-                let device = device_opt.ok_or(ConnectError::DeviceNotFound)?;
-                log::debug!(
-                    "StdImp::connect (BLE) using cached device handle for addr={}",
-                    addr
-                );
-
-                #[cfg(target_os = "ios")]
-                let already_connected = device.is_connected().await;
-                #[cfg(not(target_os = "ios"))]
-                let already_connected = false;
-
-                if !already_connected {
-                    adapter
-                        .connect_device(&device)
-                        .await
-                        .map_err(|_| ConnectError::TargetRejected)?;
-                    log::info!(
-                        "StdImp::connect (BLE) controller connection established addr={}",
-                        addr
-                    );
-                } else {
-                    log::info!(
-                        "StdImp::connect (BLE) controller already connected at system level addr={}",
-                        addr
-                    );
-                }
-
-                let mut attempts = 0;
-                while !device.is_connected().await {
-                    if attempts >= 20 {
-                        log::warn!(
-                            "StdImp::connect (BLE) device still reports disconnected after {} checks",
-                            attempts
-                        );
-                        break;
-                    }
-                    attempts += 1;
-                    log::debug!(
-                        "StdImp::connect (BLE) waiting for device to report connected (attempt {})",
-                        attempts
-                    );
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                log::info!(
-                    "StdImp::connect (BLE) device is_connected={} after wait",
-                    device.is_connected().await
-                );
-
-                if let Err(e) = device.pair().await {
-                    log::warn!("BLE pair failed: {}", e);
-                }
-
-                let services = device
-                    .discover_services()
-                    .await
-                    .map_err(|_| ConnectError::TargetRejected)?;
-                log::info!(
-                    "StdImp::connect (BLE) discovered {} services for addr={}",
-                    services.len(),
-                    addr
-                );
-
-                self.ble_chara_cache.lock().unwrap().clear();
-                self.ble_char_bundle.lock().unwrap().take();
-
-                self.ble_extract_default_characteristics(&services).await?;
-
-                *self.ble_device.lock().unwrap() = Some(device);
-                *self.ble_services.lock().unwrap() = Some(services);
-
-                let cb_opt = self.ble_on_connected.lock().unwrap().clone();
-                if let Some(cb) = cb_opt {
-                    log::info!(
-                        "StdImp::connect (BLE) invoking on_connected callback for addr={}",
-                        addr
-                    );
-                    cb();
-                } else {
-                    log::warn!(
-                        "StdImp::connect (BLE) no on_connected callback registered; upper layers may hang"
-                    );
-                }
-
-                Ok(())
-            }),
-
+                    })
+            }
+            #[cfg(not(target_os = "android"))]
+            ConnectType::BLE => tauri::async_runtime::block_on(self.connect_addressed_ble(addr)),
             #[cfg(target_os = "android")]
             ConnectType::BLE => {
                 let app = Self::app().ok_or(ConnectError::DeviceNotFound)?;
-                let spp = app.btclassic_spp();
-                log::info!("StdImp::connect (BLE, android) addr={}", addr);
-                match spp.connect_ble(&addr) {
-                    Ok(res) if res.ret => {
-                        let cb_opt = self.ble_on_connected.lock().unwrap().clone();
-                        if let Some(cb) = cb_opt {
-                            cb();
+                app.btclassic_spp()
+                    .connect_ble(&addr)
+                    .map_err(|_| ConnectError::DeviceNotFound)
+                    .and_then(|result| {
+                        if result.ret {
+                            Ok(())
                         } else {
-                            log::warn!(
-                                "StdImp::connect (BLE, android) no on_connected callback registered; upper layers may hang"
-                            );
+                            Err(ConnectError::TargetRejected)
                         }
-                        Ok(())
-                    }
-                    Ok(_) => Err(ConnectError::TargetRejected),
-                    Err(err) => {
-                        log::warn!("StdImp::connect (BLE, android) failed: {}", err);
-                        Err(ConnectError::DeviceNotFound)
-                    }
-                }
+                    })
             }
         }
     }
 
-    fn set_on_connected_listener(&self, cb: Arc<dyn Fn() + Send + Sync + 'static>) {
-        match self.current_connect_type() {
+    fn set_on_connected_listener(
+        &self,
+        addr: &str,
+        connect_type: ConnectType,
+        cb: Arc<dyn Fn() + Send + Sync + 'static>,
+    ) {
+        let key = Self::addressed_key(addr);
+        self.addressed_connect_types
+            .lock()
+            .unwrap()
+            .insert(key.clone(), connect_type);
+        match connect_type {
             ConnectType::SPP => {
                 if let Some(app) = Self::app() {
                     let cb2 = cb.clone();
-                    let _ = app.btclassic_spp().on_connected(move || {
+                    let _ = app.btclassic_spp().on_connected(addr, move || {
                         (cb2)();
                     });
                 }
             }
+            #[cfg(not(target_os = "android"))]
             ConnectType::BLE => {
-                log::debug!("StdImp::set_on_connected_listener registered BLE callback");
-                *self.ble_on_connected.lock().unwrap() = Some(cb);
+                self.addressed_on_connected
+                    .lock()
+                    .unwrap()
+                    .insert(key.clone(), cb.clone());
+                if self
+                    .addressed_ble_sessions
+                    .lock()
+                    .unwrap()
+                    .contains_key(&key)
+                {
+                    cb();
+                }
+            }
+            #[cfg(target_os = "android")]
+            ConnectType::BLE => {
+                if let Some(app) = Self::app() {
+                    let cb2 = cb.clone();
+                    let _ = app.btclassic_spp().on_connected(addr, move || {
+                        (cb2)();
+                    });
+                }
             }
         }
     }
 
-    fn max_send_len(&self, characteristic: Option<Uuid>) -> Option<usize> {
-        match self.current_connect_type() {
-            ConnectType::SPP => {
-                let app = Self::app()?;
-                app.btclassic_spp()
-                    .get_max_send_len()
-                    .ok()
-                    .flatten()
-                    .filter(|len| *len > 0)
-            }
-
+    fn max_send_len(&self, addr: &str, characteristic: Option<Uuid>) -> Option<usize> {
+        match self.addressed_connect_type(addr)? {
+            ConnectType::SPP => Self::app()?
+                .btclassic_spp()
+                .get_max_send_len(addr)
+                .ok()
+                .flatten()
+                .filter(|len| *len > 0),
             #[cfg(not(target_os = "android"))]
-            ConnectType::BLE => {
-                let uuid = characteristic.or_else(|| self.ble_default_sent_uuid())?;
-                tauri::async_runtime::block_on(async {
-                    let chara = self.ble_get_or_discover_chara(uuid).await.ok()?;
-                    chara.max_write_len_async().await.ok()
-                })
-                .filter(|len| *len > 0)
-            }
-
+            ConnectType::BLE => self.addressed_ble_max_send_len(addr, characteristic),
             #[cfg(target_os = "android")]
-            ConnectType::BLE => {
-                let app = Self::app()?;
-                app.btclassic_spp()
-                    .get_ble_max_send_len()
-                    .ok()
-                    .flatten()
-                    .filter(|len| *len > 0)
-            }
+            ConnectType::BLE => Self::app()?
+                .btclassic_spp()
+                .get_ble_max_send_len(addr)
+                .ok()
+                .flatten()
+                .filter(|len| *len > 0),
         }
     }
 
-    fn send(&self, data: Vec<u8>, characteristic: Option<Uuid>) -> Result<(), SendError> {
-        match self.current_connect_type() {
-            ConnectType::SPP => {
-                let app = Self::app().ok_or(SendError::Disconnected)?;
-                app.btclassic_spp()
-                    .send(&data)
-                    .map_err(|_| SendError::Disconnected)
-            }
-
+    fn send(
+        &self,
+        addr: &str,
+        data: Vec<u8>,
+        characteristic: Option<Uuid>,
+    ) -> Result<(), SendError> {
+        match self
+            .addressed_connect_type(addr)
+            .ok_or(SendError::Disconnected)?
+        {
+            ConnectType::SPP => Self::app()
+                .ok_or(SendError::Disconnected)?
+                .btclassic_spp()
+                .send(addr, &data)
+                .map_err(|_| SendError::Disconnected),
             #[cfg(not(target_os = "android"))]
-            ConnectType::BLE => {
-                tauri::async_runtime::block_on(self.ble_send_impl(data, characteristic))
-            }
-
+            ConnectType::BLE => tauri::async_runtime::block_on(self.addressed_ble_send_many(
+                addr.to_string(),
+                vec![data],
+                characteristic,
+            )),
             #[cfg(target_os = "android")]
-            ConnectType::BLE => {
-                let app = Self::app().ok_or(SendError::Disconnected)?;
-                app.btclassic_spp()
-                    .send_ble(&data)
-                    .map_err(|_| SendError::Disconnected)
-            }
+            ConnectType::BLE => Self::app()
+                .ok_or(SendError::Disconnected)?
+                .btclassic_spp()
+                .send(addr, &data)
+                .map_err(|_| SendError::Disconnected),
         }
     }
 
     fn send_async(
         &self,
+        addr: &str,
         data: Vec<u8>,
         characteristic: Option<Uuid>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SendError>> + Send + '_>>
     {
-        match self.current_connect_type() {
-            ConnectType::SPP => Box::pin(async move { self.send(data, characteristic) }),
-            #[cfg(not(target_os = "android"))]
-            ConnectType::BLE => Box::pin(self.ble_send_impl(data, characteristic)),
-            #[cfg(target_os = "android")]
-            ConnectType::BLE => Box::pin(async move {
-                let _ = characteristic;
-                self.send(data, None)
-            }),
+        #[cfg(not(target_os = "android"))]
+        if self.addressed_connect_type(addr) == Some(ConnectType::BLE) {
+            return Box::pin(self.addressed_ble_send_many(
+                addr.to_string(),
+                vec![data],
+                characteristic,
+            ));
         }
+        let addr = addr.to_owned();
+        Box::pin(async move { self.send(&addr, data, characteristic) })
     }
 
     fn send_many_async(
         &self,
+        addr: &str,
         data: Vec<Vec<u8>>,
         characteristic: Option<Uuid>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SendError>> + Send + '_>>
     {
-        match self.current_connect_type() {
-            ConnectType::SPP => Box::pin(async move {
-                for item in data {
-                    self.send(item, characteristic)?;
-                }
-                Ok(())
-            }),
-            #[cfg(not(target_os = "android"))]
-            ConnectType::BLE => Box::pin(self.ble_send_many_impl(data, characteristic)),
-            #[cfg(target_os = "android")]
-            ConnectType::BLE => Box::pin(async move {
-                let _ = characteristic;
-                for item in data {
-                    self.send(item, None)?;
-                }
-                Ok(())
-            }),
+        #[cfg(not(target_os = "android"))]
+        if self.addressed_connect_type(addr) == Some(ConnectType::BLE) {
+            return Box::pin(self.addressed_ble_send_many(addr.to_string(), data, characteristic));
         }
+        let addr = addr.to_owned();
+        Box::pin(async move {
+            for item in data {
+                self.send(&addr, item, characteristic)?;
+            }
+            Ok(())
+        })
     }
 
     fn subscribe(
         &self,
+        addr: &str,
         cb: Arc<dyn Fn(Result<Vec<u8>, String>) + Send + Sync>,
         characteristic: Option<Uuid>,
     ) -> Result<(), SubscribeError> {
-        match self.current_connect_type() {
+        match self
+            .addressed_connect_type(addr)
+            .ok_or(SubscribeError::Disconnected)?
+        {
             ConnectType::SPP => {
                 let app = Self::app().ok_or(SubscribeError::Disconnected)?;
-                let spp = app.btclassic_spp();
-                let cb_clone = cb.clone();
-                spp.set_data_listener(move |res| (cb_clone)(res))
+                app.btclassic_spp()
+                    .set_data_listener(addr, move |result| cb(result))
                     .map_err(|_| SubscribeError::Disconnected)?;
-                spp.start_subscription()
+                app.btclassic_spp()
+                    .start_subscription(addr)
                     .map_err(|_| SubscribeError::Disconnected)
             }
-
             #[cfg(not(target_os = "android"))]
-            ConnectType::BLE => {
-                let uuid = match characteristic {
-                    Some(uuid) => uuid,
-                    None => self
-                        .ble_default_recv_uuid()
-                        .ok_or(SubscribeError::BleCharaNotFound)?,
-                };
-                tauri::async_runtime::block_on(async {
-                    if self.ble_device.lock().unwrap().is_none() {
-                        return Err(SubscribeError::Disconnected);
-                    }
-                    log::info!(
-                        "StdImp::subscribe (BLE) attempting to subscribe to {}",
-                        uuid
-                    );
-                    let chara = self.ble_get_or_discover_chara(uuid).await?;
-                    let cb_clone = cb.clone();
-                    tauri::async_runtime::spawn(async move {
-                        match chara.notify().await {
-                            Ok(mut notify) => {
-                                while let Some(item) = notify.next().await {
-                                    match item {
-                                        Ok(bytes) => (cb_clone)(Ok(bytes)),
-                                        Err(e) => (cb_clone)(Err(e.to_string())),
-                                    }
-                                }
-                                log::warn!(
-                                    "StdImp::subscribe (BLE) notify stream ended on {}; treating as disconnected",
-                                    uuid
-                                );
-                                (cb_clone)(Err("BLE notification stream ended".to_string()));
-                            }
-                            Err(e) => {
-                                log::error!(
-                                    "StdImp::subscribe (BLE) failed to start notify on {}: {}",
-                                    uuid,
-                                    e
-                                );
-                                (cb_clone)(Err(e.to_string()))
-                            }
-                        }
-                    });
-
-                    if let Some(service_uuid) = self.ble_default_service_uuid() {
-                        if let Ok(service_chara) =
-                            self.ble_get_or_discover_chara(service_uuid).await
-                        {
-                            if let Err(e) = service_chara.read().await {
-                                log::debug!("Failed to read Xiaomi service characteristic: {}", e);
-                            }
-                        }
-                    }
-                    Ok(())
-                })
-            }
-
+            ConnectType::BLE => self.addressed_ble_subscribe(addr, cb, characteristic),
             #[cfg(target_os = "android")]
             ConnectType::BLE => {
-                let _ = characteristic;
                 let app = Self::app().ok_or(SubscribeError::Disconnected)?;
-                let spp = app.btclassic_spp();
-                let cb_clone = cb.clone();
-                spp.set_data_listener(move |res| (cb_clone)(res))
+                app.btclassic_spp()
+                    .set_data_listener(addr, move |result| cb(result))
                     .map_err(|_| SubscribeError::Disconnected)?;
-                spp.start_ble_subscription()
+                app.btclassic_spp()
+                    .start_ble_subscription(addr)
                     .map_err(|_| SubscribeError::Disconnected)
             }
         }
     }
 
-    fn disconnect(&self) -> Result<(), DisconnectError> {
-        match self.current_connect_type() {
-            ConnectType::SPP => {
-                let app = Self::app().ok_or(DisconnectError::DeviceNotFound)?;
-                app.btclassic_spp()
-                    .disconnect()
-                    .map_err(|_| DisconnectError::DeviceNotFound)
-            }
-
+    fn disconnect(&self, addr: &str) -> Result<(), DisconnectError> {
+        let connect_type = self.addressed_connect_type(addr);
+        let result = match connect_type {
+            Some(ConnectType::SPP) => Self::app()
+                .ok_or(DisconnectError::DeviceNotFound)?
+                .btclassic_spp()
+                .disconnect(addr)
+                .map_err(|_| DisconnectError::DeviceNotFound),
             #[cfg(not(target_os = "android"))]
-            ConnectType::BLE => {
-                let dev_opt = self.ble_device.lock().unwrap().clone();
-                if let Some(dev) = dev_opt {
-                    let res = tauri::async_runtime::block_on(async {
-                        if let Ok(adapter) = Self::ble_adapter().await {
-                            adapter
-                                .disconnect_device(&dev)
-                                .await
-                                .map_err(|_| DisconnectError::DeviceNotFound)
-                        } else {
-                            Err(DisconnectError::DeviceNotFound)
-                        }
-                    });
-                    self.ble_clear_cache();
-                    res
-                } else {
-                    self.ble_clear_cache();
-                    Ok(())
-                }
-            }
-
+            Some(ConnectType::BLE) => self.disconnect_addressed_ble(addr),
             #[cfg(target_os = "android")]
-            ConnectType::BLE => {
-                self.ble_clear_cache();
-                let app = Self::app().ok_or(DisconnectError::DeviceNotFound)?;
-                app.btclassic_spp()
-                    .disconnect_ble()
-                    .map_err(|_| DisconnectError::DeviceNotFound)
-            }
-        }
+            Some(ConnectType::BLE) => Self::app()
+                .ok_or(DisconnectError::DeviceNotFound)?
+                .btclassic_spp()
+                .disconnect_ble(addr)
+                .map_err(|_| DisconnectError::DeviceNotFound),
+            None => Ok(()),
+        };
+        self.addressed_connect_types
+            .lock()
+            .unwrap()
+            .remove(&Self::addressed_key(addr));
+        result
     }
 }
 

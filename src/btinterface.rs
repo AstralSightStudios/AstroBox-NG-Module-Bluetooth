@@ -149,48 +149,51 @@ pub struct BluetoothDevice {
 }
 
 pub trait BluetoothInterface: Send + Sync + Debug {
-    fn set_connect_type(&self, connect_type: ConnectType) {
-        let _ = connect_type;
-    }
-    fn set_spp_fallback_channels(&self, channels: Vec<u8>) {
-        let _ = channels;
-    }
     fn start_scan(
         &self,
         channel: Channel<BluetoothDevice>,
         connect_type: Option<ConnectType>,
     ) -> Result<(), ScanError>;
     fn stop_scan(&self) -> Result<Vec<BluetoothDevice>, ScanError>;
-    fn connect(&self, addr: String) -> Result<(), ConnectError>;
-    fn set_on_connected_listener(&self, cb: Arc<dyn Fn() + Send + Sync + 'static>);
-    fn max_send_len(&self, characteristic: Option<Uuid>) -> Option<usize> {
-        let _ = characteristic;
-        None
-    }
-    fn send(&self, data: Vec<u8>, characteristic: Option<Uuid>) -> Result<(), SendError>;
-    fn send_async(
+
+    /// Connect one physical device. The address is part of every connection
+    /// operation; implementations must never replace another address here.
+    fn connect(
         &self,
+        addr: String,
+        connect_type: ConnectType,
+        spp_fallback_channels: Vec<u8>,
+    ) -> Result<(), ConnectError>;
+    fn set_on_connected_listener(
+        &self,
+        addr: &str,
+        connect_type: ConnectType,
+        cb: Arc<dyn Fn() + Send + Sync + 'static>,
+    );
+    fn max_send_len(&self, addr: &str, characteristic: Option<Uuid>) -> Option<usize>;
+    fn send(
+        &self,
+        addr: &str,
         data: Vec<u8>,
         characteristic: Option<Uuid>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), SendError>> + Send + '_>> {
-        Box::pin(async move { self.send(data, characteristic) })
-    }
+    ) -> Result<(), SendError>;
+    fn send_async(
+        &self,
+        addr: &str,
+        data: Vec<u8>,
+        characteristic: Option<Uuid>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SendError>> + Send + '_>>;
     fn send_many_async(
         &self,
+        addr: &str,
         data: Vec<Vec<u8>>,
         characteristic: Option<Uuid>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), SendError>> + Send + '_>> {
-        Box::pin(async move {
-            for item in data {
-                self.send_async(item, characteristic).await?;
-            }
-            Ok(())
-        })
-    }
+    ) -> Pin<Box<dyn Future<Output = Result<(), SendError>> + Send + '_>>;
     fn subscribe(
         &self,
+        addr: &str,
         cb: Arc<dyn Fn(Result<Vec<u8>, String>) + Send + Sync>,
         characteristic: Option<Uuid>,
     ) -> Result<(), SubscribeError>;
-    fn disconnect(&self) -> Result<(), DisconnectError>;
+    fn disconnect(&self, addr: &str) -> Result<(), DisconnectError>;
 }
