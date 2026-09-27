@@ -163,6 +163,7 @@ pub trait BluetoothInterface: Send + Sync + Debug {
         addr: String,
         connect_type: ConnectType,
         spp_fallback_channels: Vec<u8>,
+        unpair_before_connect: Option<bool>,
     ) -> Result<(), ConnectError>;
     fn set_on_connected_listener(
         &self,

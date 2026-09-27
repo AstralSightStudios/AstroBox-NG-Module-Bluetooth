@@ -27,6 +27,7 @@ impl BluetoothInterface for Esp32Imp {
         _addr: String,
         _connect_type: crate::btinterface::ConnectType,
         _fallback_channels: Vec<u8>,
+        _unpair_before_connect: Option<bool>,
     ) -> Result<(), crate::btinterface::ConnectError> {
         todo!()
     }

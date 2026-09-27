@@ -1263,6 +1263,7 @@ impl BluetoothInterface for StdImp {
         addr: String,
         connect_type: ConnectType,
         spp_fallback_channels: Vec<u8>,
+        unpair_before_connect: Option<bool>,
     ) -> Result<(), ConnectError> {
         let key = Self::addressed_key(&addr);
         self.addressed_connect_types
@@ -1286,8 +1287,9 @@ impl BluetoothInterface for StdImp {
         match connect_type {
             ConnectType::SPP => {
                 let app = Self::app().ok_or(ConnectError::DeviceNotFound)?;
+                let remove_bond = unpair_before_connect.unwrap_or(true);
                 app.btclassic_spp()
-                    .connect(&addr, true, &fallback_channels)
+                    .connect(&addr, remove_bond, &fallback_channels)
                     .map_err(|_| ConnectError::DeviceNotFound)
                     .and_then(|result| {
                         if result.ret {
