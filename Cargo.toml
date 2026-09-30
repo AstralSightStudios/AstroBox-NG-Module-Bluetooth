@@ -16,4 +16,4 @@ serde = "1.0.228"
 log = "0.4"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
-bluest = { version = "0.6.9", features = ["unstable"] }
+bluest = { version = "0.6.9", features = ["unstable", "serde"] }

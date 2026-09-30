@@ -5,7 +5,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     sync::{Arc, Mutex, OnceLock},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[cfg(not(target_os = "android"))]
@@ -38,7 +38,7 @@ const VIVO_MANUFACTURER_ID: u16 = 2103;
 static APP_HANDLE: OnceLock<AppHandle<Wry>> = OnceLock::new();
 
 #[cfg(not(target_os = "android"))]
-static BLE_ADAPTER: OnceLock<Adapter> = OnceLock::new();
+static BLE_ADAPTER: tokio::sync::OnceCell<Adapter> = tokio::sync::OnceCell::const_new();
 
 pub fn init(app: AppHandle<Wry>) -> tauri::Result<()> {
     app.plugin(btclassic_spp::init())?;
@@ -54,6 +54,13 @@ pub fn normalize_addr_for_dedup(raw: &str) -> String {
     let s = raw.trim();
     if s.is_empty() {
         return String::new();
+    }
+
+    // CoreBluetooth identifiers are full UUIDs, not the last six bytes of a MAC.
+    if s.len() == 36 && s.bytes().enumerate().all(|(index, byte)| {
+        if matches!(index, 8 | 13 | 18 | 23) { byte == b'-' } else { byte.is_ascii_hexdigit() }
+    }) {
+        return s.to_ascii_uppercase();
     }
 
     let mut hex: String = s.chars().filter(|c: &char| is_hex(*c)).collect();
@@ -114,6 +121,21 @@ struct AddressedBleSession {
     chara_cache: Arc<Mutex<HashMap<Uuid, Characteristic>>>,
     char_bundle: BleCharacteristicBundle,
     send_lock: Arc<AsyncMutex<()>>,
+    notification_tasks: Mutex<HashMap<Uuid, tauri::async_runtime::JoinHandle<()>>>,
+}
+
+#[cfg(not(target_os = "android"))]
+impl AddressedBleSession {
+    async fn stop_notifications(&self) {
+        let tasks = std::mem::take(&mut *self.notification_tasks.lock().unwrap());
+        for task in tasks.values() {
+            task.abort();
+        }
+        // Dropping the old notify stream disables the CCCD; finish that before a reconnect.
+        for (_, task) in tasks {
+            let _ = task.await;
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -166,22 +188,14 @@ impl StdImp {
 
     #[cfg(not(target_os = "android"))]
     async fn ble_adapter() -> Result<&'static Adapter, ConnectError> {
-        if let Some(adapter) = BLE_ADAPTER.get() {
-            return Ok(adapter);
-        }
-
-        let adapter = Adapter::default()
-            .await
-            .ok_or(ConnectError::DeviceNotFound)?;
-        adapter
-            .wait_available()
-            .await
-            .map_err(|_| ConnectError::DeviceNotFound)?;
-
-        if BLE_ADAPTER.set(adapter).is_err() {
-            // another concurrent initializer won the race; fall through
-        }
-        BLE_ADAPTER.get().ok_or(ConnectError::DeviceNotFound)
+        BLE_ADAPTER.get_or_try_init(|| async {
+            let adapter = Adapter::default().await.ok_or(ConnectError::DeviceNotFound)?;
+            tokio::time::timeout(Duration::from_secs(10), adapter.wait_available())
+                .await
+                .map_err(|_| ConnectError::DeviceNotFound)?
+                .map_err(|_| ConnectError::DeviceNotFound)?;
+            Ok(adapter)
+        }).await
     }
 
     #[cfg(not(target_os = "android"))]
@@ -288,13 +302,21 @@ impl StdImp {
     }
 
     #[cfg(target_os = "ios")]
+    async fn ble_connected_devices(adapter: &Adapter) -> bluest::Result<Vec<BluestDevice>> {
+        adapter.connected_devices_with_services(&[
+            Uuid::from_u128(0x0000fe95_0000_1000_8000_00805f9b34fb),
+            Uuid::from_u128(0x00002760_08c2_11e1_9073_0e8ac72e1011),
+        ]).await
+    }
+
+    #[cfg(target_os = "ios")]
     async fn ble_probe_connected_device_by_addr(
         &self,
         adapter: &Adapter,
         addr: &str,
     ) -> Option<BluestDevice> {
         let normalized_target = normalize_addr_for_dedup(addr);
-        match adapter.connected_devices().await {
+        match Self::ble_connected_devices(adapter).await {
             Ok(devices) => {
                 for dev in devices {
                     let id = dev.id().to_string();
@@ -330,7 +352,7 @@ impl StdImp {
         adapter: &Adapter,
         channel: &tauri::ipc::Channel<BluetoothDevice>,
     ) {
-        match adapter.connected_devices().await {
+        match Self::ble_connected_devices(adapter).await {
             Ok(devices) => {
                 for dev in devices {
                     let addr = dev.id().to_string();
@@ -445,6 +467,7 @@ impl StdImp {
             chara_cache: Arc::new(Mutex::new(chara_cache)),
             char_bundle: bundle,
             send_lock: Arc::new(AsyncMutex::new(())),
+            notification_tasks: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -481,11 +504,26 @@ impl StdImp {
         let key = Self::addressed_key(&addr);
         let adapter = Self::ble_adapter().await?;
 
-        if let Some(old_session) = self.addressed_ble_sessions.lock().unwrap().remove(&key) {
-            let _ = adapter.disconnect_device(&old_session.device).await;
+        let old_session = self.addressed_ble_sessions.lock().unwrap().remove(&key);
+        if let Some(old_session) = old_session {
+            old_session.stop_notifications().await;
+            let _ = tokio::time::timeout(
+                Duration::from_secs(3), adapter.disconnect_device(&old_session.device),
+            ).await;
         }
 
         let mut device_opt = self.ble_scanned_devices.lock().unwrap().get(&addr).cloned();
+
+        #[cfg(target_os = "ios")]
+        if device_opt.is_none() {
+            use serde::Deserialize;
+            let id = bluest::DeviceId::deserialize(
+                serde::de::value::StrDeserializer::<serde::de::value::Error>::new(&addr),
+            );
+            if let Ok(id) = id {
+                device_opt = adapter.open_device(&id).await.ok();
+            }
+        }
 
         #[cfg(target_os = "ios")]
         if device_opt.is_none() {
@@ -505,66 +543,53 @@ impl StdImp {
                 .scan(&[])
                 .await
                 .map_err(|_| ConnectError::DeviceNotFound)?;
-            let deadline = Instant::now() + Duration::from_secs(12);
-            while Instant::now() < deadline {
-                if let Some(item) = scan.next().await {
-                    let raw_id = item.device.id().to_string();
-                    let vivo_mac =
-                        Self::parse_vivo_advertisement(&item.adv_data).map(|info| info.mac);
-                    if raw_id.eq_ignore_ascii_case(&addr)
-                        || vivo_mac
-                            .as_ref()
-                            .is_some_and(|mac| mac.eq_ignore_ascii_case(&addr))
-                    {
-                        let device = item.device.clone();
-                        let mut cache = self.ble_scanned_devices.lock().unwrap();
-                        cache.insert(raw_id, device.clone());
-                        cache.insert(addr.clone(), device.clone());
-                        if let Some(mac) = vivo_mac {
-                            cache.insert(mac, device.clone());
-                        }
-                        device_opt = Some(device);
-                        break;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+            while let Ok(Some(item)) = tokio::time::timeout_at(deadline, scan.next()).await {
+                let raw_id = item.device.id().to_string();
+                let vivo_mac = Self::parse_vivo_advertisement(&item.adv_data).map(|info| info.mac);
+                if raw_id.eq_ignore_ascii_case(&addr)
+                    || vivo_mac.as_ref().is_some_and(|mac| mac.eq_ignore_ascii_case(&addr))
+                {
+                    let device = item.device.clone();
+                    let mut cache = self.ble_scanned_devices.lock().unwrap();
+                    cache.insert(raw_id, device.clone());
+                    cache.insert(addr.clone(), device.clone());
+                    if let Some(mac) = vivo_mac {
+                        cache.insert(mac, device.clone());
                     }
-                } else {
-                    tokio::time::sleep(Duration::from_millis(60)).await;
+                    device_opt = Some(device);
+                    break;
                 }
             }
         }
 
         let device = device_opt.ok_or(ConnectError::DeviceNotFound)?;
-        #[cfg(target_os = "ios")]
-        let already_connected = device.is_connected().await;
-        #[cfg(not(target_os = "ios"))]
-        let already_connected = false;
-
-        if !already_connected {
-            adapter
-                .connect_device(&device)
-                .await
-                .map_err(|_| ConnectError::TargetRejected)?;
-        }
-
-        let mut attempts = 0;
-        while !device.is_connected().await {
-            if attempts >= 20 {
-                break;
+        let setup = tokio::time::timeout(Duration::from_secs(20), async {
+            // A system-connected peripheral still needs a connection owned by this central.
+            adapter.connect_device(&device).await
+                .map_err(|err| {
+                    log::warn!("BLE connect failed for {addr}: {err}");
+                    ConnectError::TargetRejected
+                })?;
+            if let Err(err) = device.pair().await {
+                log::warn!("BLE pair failed for {addr}: {err}");
             }
-            attempts += 1;
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        if !device.is_connected().await {
-            return Err(ConnectError::TargetRejected);
-        }
-
-        if let Err(err) = device.pair().await {
-            log::warn!("BLE pair failed for {}: {}", addr, err);
-        }
-        let services = device
-            .discover_services()
-            .await
-            .map_err(|_| ConnectError::TargetRejected)?;
-        let session = Self::build_addressed_ble_session(device, services).await?;
+            let services = device.discover_services().await.map_err(|err| {
+                log::warn!("BLE service discovery failed for {addr}: {err}");
+                ConnectError::TargetRejected
+            })?;
+            Self::build_addressed_ble_session(device.clone(), services).await
+        }).await;
+        let session = match setup {
+            Ok(Ok(session)) => session,
+            result => {
+                log::warn!("BLE setup failed for {addr}; timed_out={}", result.is_err());
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(3), adapter.disconnect_device(&device),
+                ).await;
+                return Err(ConnectError::TargetRejected);
+            }
+        };
         self.addressed_ble_sessions
             .lock()
             .unwrap()
@@ -667,26 +692,44 @@ impl StdImp {
                 return Err(SubscribeError::Disconnected);
             }
             let chara = Self::addressed_ble_get_or_discover_chara(&session, uuid).await?;
-            tauri::async_runtime::spawn(async move {
-                match chara.notify().await {
-                    Ok(mut notify) => {
-                        while let Some(item) = notify.next().await {
-                            match item {
-                                Ok(bytes) => cb(Ok(bytes)),
-                                Err(err) => cb(Err(err.to_string())),
-                            }
-                        }
-                        cb(Err("BLE notification stream ended".to_string()));
+            let old_task = session.notification_tasks.lock().unwrap().remove(&uuid);
+            if let Some(task) = old_task {
+                task.abort();
+                let _ = task.await;
+            }
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let task = tauri::async_runtime::spawn(async move {
+                let mut notify = match tokio::time::timeout(Duration::from_secs(10), chara.notify()).await {
+                    Ok(Ok(notify)) => notify,
+                    result => {
+                        log::warn!("BLE notification setup failed for {uuid}: {}",
+                            match result { Ok(Err(err)) => err.to_string(), _ => "timed out".to_string() });
+                        let _ = ready_tx.send(Err(SubscribeError::Disconnected));
+                        return;
                     }
-                    Err(err) => cb(Err(err.to_string())),
+                };
+                if ready_tx.send(Ok(())).is_err() {
+                    return;
                 }
+                while let Some(item) = notify.next().await {
+                    match item {
+                        Ok(bytes) => cb(Ok(bytes)),
+                        Err(err) => {
+                            cb(Err(err.to_string()));
+                            return;
+                        }
+                    }
+                }
+                cb(Err("BLE notification stream ended".to_string()));
             });
+            session.notification_tasks.lock().unwrap().insert(uuid, task);
+            ready_rx.await.map_err(|_| SubscribeError::Disconnected)??;
             if let Some(service_uuid) = session.char_bundle.service {
                 if let Ok(service_chara) =
                     Self::addressed_ble_get_or_discover_chara(&session, service_uuid).await
                 {
-                    if let Err(err) = service_chara.read().await {
-                        log::debug!("Failed to read Xiaomi service characteristic: {}", err);
+                    if !matches!(tokio::time::timeout(Duration::from_secs(5), service_chara.read()).await, Ok(Ok(_))) {
+                        log::debug!("Failed to read Xiaomi service characteristic");
                     }
                 }
             }
@@ -703,12 +746,13 @@ impl StdImp {
             return Ok(());
         };
         tauri::async_runtime::block_on(async {
+            session.stop_notifications().await;
             let adapter = Self::ble_adapter()
                 .await
                 .map_err(|_| DisconnectError::DeviceNotFound)?;
-            adapter
-                .disconnect_device(&session.device)
+            tokio::time::timeout(Duration::from_secs(3), adapter.disconnect_device(&session.device))
                 .await
+                .map_err(|_| DisconnectError::DeviceNotFound)?
                 .map_err(|_| DisconnectError::DeviceNotFound)
         })
     }
@@ -1343,15 +1387,7 @@ impl BluetoothInterface for StdImp {
                 self.addressed_on_connected
                     .lock()
                     .unwrap()
-                    .insert(key.clone(), cb.clone());
-                if self
-                    .addressed_ble_sessions
-                    .lock()
-                    .unwrap()
-                    .contains_key(&key)
-                {
-                    cb();
-                }
+                    .insert(key, cb);
             }
             #[cfg(target_os = "android")]
             ConnectType::BLE => {
@@ -1517,6 +1553,25 @@ impl BluetoothInterface for StdImp {
 #[cfg(test)]
 mod tests {
     use super::StdImp;
+
+    #[test]
+    fn peripheral_uuids_do_not_collapse_to_the_same_mac_suffix() {
+        let first = "12345678-1234-1234-1234-aabbccddeeff";
+        let second = "87654321-4321-4321-4321-aabbccddeeff";
+        assert_eq!(super::normalize_addr_for_dedup(first), first.to_ascii_uppercase());
+        assert_ne!(super::normalize_addr_for_dedup(first), super::normalize_addr_for_dedup(second));
+        assert_eq!(super::normalize_addr_for_dedup("aa-bb-cc-dd-ee-ff"), "AA:BB:CC:DD:EE:FF");
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn registering_a_ble_listener_does_not_report_a_connection() {
+        let iface = StdImp::new(crate::btinterface::ConnectType::BLE);
+        crate::btinterface::BluetoothInterface::set_on_connected_listener(
+            &iface, "device", crate::btinterface::ConnectType::BLE,
+            std::sync::Arc::new(|| panic!("listener registration is not a connection")),
+        );
+    }
 
     #[test]
     fn vivo_manufacturer_data_matches_java_scan_record_layout() {
