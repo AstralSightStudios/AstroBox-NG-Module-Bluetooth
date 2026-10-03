@@ -94,6 +94,8 @@ pub struct StdImp {
     addressed_ble_sessions: Mutex<HashMap<String, Arc<AddressedBleSession>>>,
     #[cfg(not(target_os = "android"))]
     ble_scanned_devices: Arc<Mutex<HashMap<String, BluestDevice>>>,
+    // Scan commands run on blocking workers; serialize transport/session changes.
+    scan_operation_lock: Mutex<()>,
     scan_state: Arc<Mutex<Option<ScanSession>>>,
     scan_seq: AtomicUsize,
     scan_results: Arc<Mutex<Vec<BluetoothDevice>>>,
@@ -175,6 +177,7 @@ impl StdImp {
             addressed_ble_sessions: Mutex::new(HashMap::new()),
             #[cfg(not(target_os = "android"))]
             ble_scanned_devices: Arc::new(Mutex::new(HashMap::new())),
+            scan_operation_lock: Mutex::new(()),
             scan_state: Arc::new(Mutex::new(None)),
             scan_seq: AtomicUsize::new(0),
             scan_results: Arc::new(Mutex::new(Vec::new())),
@@ -764,6 +767,7 @@ impl BluetoothInterface for StdImp {
         channel: tauri::ipc::Channel<BluetoothDevice>,
         connect_type: Option<ConnectType>,
     ) -> Result<(), ScanError> {
+        let _operation_guard = self.scan_operation_lock.lock().unwrap();
         let scan_connect_type = connect_type.unwrap_or(self.scan_connect_type);
         log::info!(
             "StdImp::start_scan invoked for {:?}; default transport={:?}; current scan_state active={} (linux={})",
@@ -807,6 +811,12 @@ impl BluetoothInterface for StdImp {
                     }
                 }
 
+                // Do not register a session or start polling if native startup fails.
+                app.btclassic_spp().start_scan().map_err(|err| {
+                    log::warn!("StdImp::start_scan (SPP) failed to start discovery: {err:#}");
+                    ScanError::AdapterNotFound
+                })?;
+
                 let (abort_reg, session_id) = {
                     let mut guard = self.scan_state.lock().unwrap();
                     let session_id = self
@@ -827,21 +837,26 @@ impl BluetoothInterface for StdImp {
                     let fut = async move {
                         let mut known_addrs = HashSet::<String>::new();
                         loop {
-                            if let Ok(res) = app_handle.btclassic_spp().get_scanned_devices() {
-                                for d in res.ret {
-                                    let name = d.name.unwrap_or_default();
-                                    let raw_addr = d.address;
-                                    let key = normalize_addr_for_dedup(&raw_addr);
-                                    if key.is_empty() {
-                                        continue;
-                                    }
-                                    if known_addrs.insert(key) {
-                                        let _ = channel.send(BluetoothDevice {
-                                            name,
-                                            addr: raw_addr,
-                                            connect_type: Some(ConnectType::SPP),
-                                        });
-                                    }
+                            let res = match app_handle.btclassic_spp().get_scanned_devices() {
+                                Ok(res) => res,
+                                Err(err) => {
+                                    log::warn!("StdImp::start_scan (SPP) discovery stopped: {err:#}");
+                                    break;
+                                }
+                            };
+                            for d in res.ret {
+                                let name = d.name.unwrap_or_default();
+                                let raw_addr = d.address;
+                                let key = normalize_addr_for_dedup(&raw_addr);
+                                if key.is_empty() {
+                                    continue;
+                                }
+                                if known_addrs.insert(key) {
+                                    let _ = channel.send(BluetoothDevice {
+                                        name,
+                                        addr: raw_addr,
+                                        connect_type: Some(ConnectType::SPP),
+                                    });
                                 }
                             }
                             tokio::time::sleep(Duration::from_millis(800)).await;
@@ -857,9 +872,6 @@ impl BluetoothInterface for StdImp {
                     }
                 });
 
-                app.btclassic_spp()
-                    .start_scan()
-                    .map_err(|_| ScanError::AdapterNotFound)?;
                 Ok(())
             }
 
@@ -874,7 +886,12 @@ impl BluetoothInterface for StdImp {
                     guard.take()
                 } {
                     match session {
-                        ScanSession::Spp { .. } => {}
+                        ScanSession::Spp { abort_handle, .. } => {
+                            abort_handle.abort();
+                            if let Some(app) = Self::app() {
+                                let _ = app.btclassic_spp().stop_scan();
+                            }
+                        }
                         ScanSession::Ble {
                             cancel_tx,
                             finished_rx,
@@ -1197,6 +1214,7 @@ impl BluetoothInterface for StdImp {
     }
 
     fn stop_scan(&self) -> Result<Vec<BluetoothDevice>, ScanError> {
+        let _operation_guard = self.scan_operation_lock.lock().unwrap();
         let session = {
             let mut guard = self.scan_state.lock().unwrap();
             guard.take()
