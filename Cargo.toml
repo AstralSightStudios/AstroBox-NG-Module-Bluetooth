@@ -6,10 +6,11 @@ edition = "2024"
 [dependencies]
 async-trait = "0.1.89"
 btclassic-spp = { path = "../../plugins/btclassic-spp" }
+frontbridge = { path = "../frontbridge" }
 # 这里引入tauri作为依赖只是用一下它的类型
 # 如果你正在为单片机做porting，且不需要用btclassic-spp，请一并删掉该依赖
 # 该依赖的版本需要与app的tauri版本同步
-tauri = { version = "2.11.3", features = ["rustls-tls"] }
+tauri = { version = "2.11.3", default-features = false, features = ["rustls-tls"] }
 futures-util = "0.3"
 tokio = "1.48.0"
 serde = "1.0.228"

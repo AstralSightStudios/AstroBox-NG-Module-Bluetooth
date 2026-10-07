@@ -19,7 +19,7 @@ use futures_util::{
     future::{AbortHandle, Abortable},
     StreamExt,
 };
-use tauri::{AppHandle, Wry};
+use frontbridge::runtime::AppHandle;
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
 use crate::btinterface::{
@@ -35,12 +35,12 @@ const BLE_UUID_VIVO_SENT: &str = "0000276008c211e190730e8ac72e0011";
 const BLE_UUID_VIVO_RECV: &str = "0000276008c211e190730e8ac72e0012";
 const VIVO_MANUFACTURER_ID: u16 = 2103;
 
-static APP_HANDLE: OnceLock<AppHandle<Wry>> = OnceLock::new();
+static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
 
 #[cfg(not(target_os = "android"))]
 static BLE_ADAPTER: tokio::sync::OnceCell<Adapter> = tokio::sync::OnceCell::const_new();
 
-pub fn init(app: AppHandle<Wry>) -> tauri::Result<()> {
+pub fn init(app: AppHandle) -> tauri::Result<()> {
     app.plugin(btclassic_spp::init())?;
     let _ = APP_HANDLE.set(app);
     Ok(())
@@ -185,7 +185,7 @@ impl StdImp {
     }
 
     #[inline]
-    fn app() -> Option<&'static AppHandle<Wry>> {
+    fn app() -> Option<&'static AppHandle> {
         APP_HANDLE.get()
     }
 
