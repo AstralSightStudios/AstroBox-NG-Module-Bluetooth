@@ -1,4 +1,6 @@
 pub mod btinterface;
+pub mod emu;
+pub mod router;
 pub mod stdimp;
 
 use std::sync::OnceLock;
