@@ -1,21 +1,29 @@
-//! cargo run -p bluetooth --example emulator -- <port> <state-directory> [bind]
+//! cargo run -p bluetooth --example emulator -- <port> <state-directory> [bind] [<seconds>]
+//! cargo run -p bluetooth --example emulator -- <port> <state-directory> install <file.rpk> <package>
 //! Confirm pairing/binding on the emulator's screen. No firmware patches.
-use std::{path::PathBuf, sync::Arc, time::Duration};
+//! EMU_DEBUG=1 adds debug logs (RFCOMM credits, every packet the core sends).
+use std::{path::PathBuf, sync::{Arc, OnceLock}, time::{Duration, Instant}};
 use bluetooth::emu::bridge;
 use corelib::device::{DeviceKind, xiaomi::{components::{auth::AuthComponent, bind::{LocalBindConfig, XiaomiConnectOptions}}, packet::dispatcher, r#type::ConnectType}};
 
 struct Logger;
 impl log::Log for Logger {
-    fn enabled(&self, m: &log::Metadata) -> bool { m.level() <= log::Level::Info }
-    fn log(&self, r: &log::Record) { if self.enabled(r.metadata()) { eprintln!("{} {}", r.level(), r.args()); } }
+    fn enabled(&self, m: &log::Metadata) -> bool { m.level() <= log::max_level() }
+    fn log(&self, r: &log::Record) {
+        if self.enabled(r.metadata()) {
+            let t = START.get_or_init(Instant::now).elapsed().as_secs_f64();
+            eprintln!("{t:8.3} {} {}", r.level(), r.args());
+        }
+    }
     fn flush(&self) {}
 }
 static LOGGER: Logger = Logger;
+static START: OnceLock<Instant> = OnceLock::new();
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::set_logger(&LOGGER).unwrap();
-    log::set_max_level(log::LevelFilter::Info);
+    log::set_max_level(if std::env::var_os("EMU_DEBUG").is_some() { log::LevelFilter::Debug } else { log::LevelFilter::Info });
     let args: Vec<_> = std::env::args().collect();
     let port: u16 = args.get(1).ok_or("missing port")?.parse()?;
     let dir = PathBuf::from(args.get(2).ok_or("missing state directory")?);
@@ -51,8 +59,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let info = tokio::time::timeout(Duration::from_secs(120), corelib::device::create_device_with_options(
         handle, DeviceKind::Xiaomi, found.name, found.addr.clone(), authkey, 2,
-        ConnectType::SPP, None, bridge().max_send_len(), None, true, options,
+        ConnectType::SPP, Some(6), bridge().max_send_len(), None, false, options,
         |data| async move {
+            log::debug!("core send: {} packet(s), {:?} bytes", data.len(), data.iter().map(Vec::len).collect::<Vec<_>>());
             bridge().send_async(data).await.map_err(|e| corelib::device::xiaomi::SendError::Io(format!("{e:?}")))
         },
     )).await??;
@@ -100,7 +109,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         res => println!("Failed to get device status: {res:?}"),
     }
 
-    let duration_secs = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(10);
+    if args.get(3).is_some_and(|s| s == "install") {
+        let file = args.get(4).ok_or("missing package file")?;
+        let package = args.get(5).ok_or("missing package name")?.clone();
+        let data = std::fs::read(file)?;
+        let len = data.len();
+        println!("Installing {package} ({len} bytes)...");
+        let started = Instant::now();
+        let last = Arc::new(std::sync::Mutex::new(-1i64));
+        let addr_for_install = addr.clone();
+        let fut = corelib::ecs::with_rt_mut(move |rt| {
+            rt.with_device_mut(&addr_for_install, |world, entity| {
+                let mut sys = world.get_mut::<corelib::device::xiaomi::components::install::InstallSystem>(entity).unwrap();
+                sys.send_install_request_with_progress(
+                    corelib::device::xiaomi::packet::mass::MassDataType::ThirdPartyApp,
+                    data,
+                    Some(&package),
+                    Arc::new(move |pg| {
+                        let pct = (pg.progress * 100.0) as i64;
+                        let mut last = last.lock().unwrap();
+                        if pct / 10 != *last / 10 {
+                            *last = pct;
+                            let secs = started.elapsed().as_secs_f64();
+                            println!("  {pct:3}% part {}/{} after {secs:.1}s ({:.1} KB/s)",
+                                pg.current_part_num, pg.total_parts, pg.progress as f64 * len as f64 / 1024.0 / secs);
+                        }
+                    }),
+                    None,
+                )
+            }).unwrap()
+        }).await?;
+        let result = fut.await;
+        let secs = started.elapsed().as_secs_f64();
+        println!("Install finished after {secs:.1}s ({:.1} KB/s): {result:?}", len as f64 / 1024.0 / secs);
+        bridge().detach();
+        return Ok(());
+    }
+
+    let duration_secs = args.iter().skip(3).find_map(|s| s.parse().ok()).unwrap_or(10);
     println!("Connection active. Running for {duration_secs}s...");
     tokio::time::sleep(Duration::from_secs(duration_secs)).await;
     bridge().detach();

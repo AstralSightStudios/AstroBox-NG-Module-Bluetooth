@@ -632,6 +632,7 @@ impl Stack {
                 let rf = &mut self.link.as_mut().unwrap().rfcomm;
                 if let Some(c) = f.credits {
                     rf.tx_credits += c as u32;
+                    log::debug!(target: "emubt", "band granted {c} RFCOMM credits ({} now)", rf.tx_credits);
                 }
                 if f.info.is_empty() {
                     return;
@@ -1236,6 +1237,7 @@ impl Session {
     pub fn send(&self, data: &[u8]) -> Result<(), String> {
         let n1 = self.max_send_len().ok_or("not connected")?;
         for chunk in data.chunks(n1.max(1)) {
+            let waited = Instant::now();
             self.wait(Duration::from_secs(10), "RFCOMM credits", |st| {
                 let rf = &mut st.link.as_mut()?.rfcomm;
                 if !rf.open {
@@ -1249,6 +1251,10 @@ impl Session {
                 }
                 Some(Ok(()))
             })??;
+            let waited = waited.elapsed();
+            if waited > Duration::from_millis(5) {
+                log::debug!(target: "emubt", "waited {} ms for RFCOMM credits", waited.as_millis());
+            }
             self.with(|st| {
                 let dlci = st.link.as_ref().map(|l| l.rfcomm.dlci).unwrap_or(0);
                 st.tx_bytes += chunk.len() as u64;
