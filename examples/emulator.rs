@@ -30,9 +30,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&dir)?;
     let keys = dir.join("link-keys");
     tokio::task::spawn_blocking(move || bridge().attach("127.0.0.1", port, Some(keys))).await??;
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    let status = bridge().status();
-    let found = status.session.devices.first().ok_or("band not found")?.clone();
+    // a bound band does not answer inquiries: it shows up once it sends its
+    // LE reconnect beacon (wait EMU_WAIT seconds, default 3), or add it by
+    // address with EMU_BAND=<addr>
+    if let Ok(addr) = std::env::var("EMU_BAND") {
+        bridge().add_device(&addr)?;
+    }
+    let wait: u64 = std::env::var("EMU_WAIT").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+    let deadline = Instant::now() + Duration::from_secs(wait);
+    let found = loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Some(d) = bridge().status().session.devices.first() {
+            break d.clone();
+        }
+        if Instant::now() >= deadline {
+            return Err("band not found".into());
+        }
+    };
     let addr = found.addr.clone();
     tokio::task::spawn_blocking(move || bridge().connect(&addr, &[5, 1], false).map_err(|e| format!("{e:?}"))).await??;
     corelib::ecs::init_runtime_default();

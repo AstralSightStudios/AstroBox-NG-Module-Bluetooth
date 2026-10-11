@@ -272,6 +272,7 @@ impl Stack {
                 self.remember(addr, name);
                 self.found.push((format_bdaddr(&addr), shown));
             }
+            0x3E if p.first() == Some(&0x02) => self.on_le_adv_reports(&p[1..]),
             0x07 if p.len() >= 7 => {
                 let mut addr = [0u8; 6];
                 addr.copy_from_slice(&p[1..7]);
@@ -366,6 +367,40 @@ impl Stack {
                 self.note(format!("simple pairing complete: status 0x{:02x}", p[0]));
             }
             _ => {}
+        }
+    }
+
+    /// LE Advertising Reports: a bound band no longer answers inquiries
+    /// but still advertises (its reconnect beacon), from its public address.
+    fn on_le_adv_reports(&mut self, p: &[u8]) {
+        let Some(&count) = p.first() else { return };
+        let mut i = 1;
+        for _ in 0..count {
+            if i + 9 > p.len() {
+                return;
+            }
+            let (addr_type, len) = (p[i + 1], p[i + 8] as usize);
+            if i + 10 + len > p.len() {
+                return;
+            }
+            let mut addr = [0u8; 6];
+            addr.copy_from_slice(&p[i + 2..i + 8]);
+            let data = &p[i + 9..i + 9 + len];
+            i += 10 + len;
+            if addr_type != 0 || self.known.iter().any(|(a, n)| *a == addr && !n.is_empty()) {
+                continue;
+            }
+            let name = eir_name(data);
+            let shown = name.clone().unwrap_or_else(|| format_bdaddr(&addr));
+            self.note(format!("LE advertising: found {} ({shown})", format_bdaddr(&addr)));
+            if name.is_none() {
+                // the name comes over BR/EDR (Remote Name Request Complete)
+                let mut rp = addr.to_vec();
+                rp.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+                self.command(0x0419, &rp);
+            }
+            self.remember(addr, name);
+            self.found.push((format_bdaddr(&addr), shown));
         }
     }
 
@@ -913,6 +948,10 @@ impl Session {
         name.resize(248, 0);
         self.command_ok(0x0C13, &name)?;
         self.command_ok(0x0C24, &LOCAL_COD)?;
+        // passive LE scan for as long as the bridge is attached
+        self.command_ok(0x0C6D, &[0x01, 0x00])?; // LE Host Support
+        self.command_ok(0x200B, &[0x00, 0x60, 0x00, 0x30, 0x00, 0x00, 0x00])?;
+        self.command_ok(0x200C, &[0x01, 0x00])?;
         self.with(|st| {
             if rp.len() >= 7 {
                 st.local.copy_from_slice(&rp[1..7]);
@@ -924,6 +963,18 @@ impl Session {
             st.note(format!("bridge up: local {local}, ACL {} bytes", st.acl_mtu));
         });
         Ok(())
+    }
+
+    /// List a band known by address and ask it for its name: once bound it
+    /// no longer answers inquiries, and its LE beacon may have been missed.
+    pub fn add_device(&self, addr: [u8; 6]) {
+        self.with(|st| {
+            st.note(format!("added {} by address", format_bdaddr(&addr)));
+            st.remember(addr, None);
+            let mut rp = addr.to_vec();
+            rp.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+            st.command(0x0419, &rp);
+        });
     }
 
     pub fn set_data_callback(&self, cb: Option<DataCallback>) {

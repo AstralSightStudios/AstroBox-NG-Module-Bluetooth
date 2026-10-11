@@ -106,6 +106,15 @@ impl EmuBridge {
         session.inquiry(4, None)
     }
 
+    /// List a band by its address (see `Session::add_device`).
+    pub fn add_device(&self, addr: &str) -> Result<(), String> {
+        let session = self.session().ok_or("the emulator bridge is not attached")?;
+        let a = codec::parse_bdaddr(&crate::stdimp::normalize_addr_for_dedup(addr))
+            .ok_or_else(|| format!("not a Bluetooth address: {addr}"))?;
+        session.add_device(a);
+        Ok(())
+    }
+
     /// Bridge log lines from index `since`; returns the next index.
     pub fn log(&self, since: usize) -> (usize, Vec<String>) {
         self.session().map(|s| s.log_lines(since)).unwrap_or((0, Vec::new()))
